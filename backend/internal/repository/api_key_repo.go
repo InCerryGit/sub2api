@@ -43,6 +43,7 @@ func (r *apiKeyRepository) activeQuery() *dbent.APIKeyQuery {
 func (r *apiKeyRepository) Create(ctx context.Context, key *service.APIKey) error {
 	builder := r.client.APIKey.Create().
 		SetUserID(key.UserID).
+		SetConcurrencyLimit(key.ConcurrencyLimit).
 		SetKey(key.Key).
 		SetName(key.Name).
 		SetStatus(key.Status).
@@ -140,6 +141,7 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 			apikey.FieldQuotaUsed,
 			apikey.FieldExpiresAt,
 			apikey.FieldRateLimit5h,
+			apikey.FieldConcurrencyLimit,
 			apikey.FieldRateLimit1d,
 			apikey.FieldRateLimit7d,
 		).
@@ -231,6 +233,7 @@ func (r *apiKeyRepository) Update(ctx context.Context, key *service.APIKey) erro
 	now := time.Now()
 	builder := client.APIKey.Update().
 		Where(apikey.IDEQ(key.ID), apikey.DeletedAtIsNil()).
+		SetConcurrencyLimit(key.ConcurrencyLimit).
 		SetName(key.Name).
 		SetStatus(key.Status).
 		SetQuota(key.Quota).
@@ -827,29 +830,30 @@ func apiKeyEntityToService(m *dbent.APIKey) *service.APIKey {
 		return nil
 	}
 	out := &service.APIKey{
-		ID:            m.ID,
-		UserID:        m.UserID,
-		Key:           m.Key,
-		Name:          m.Name,
-		Status:        m.Status,
-		IPWhitelist:   m.IPWhitelist,
-		IPBlacklist:   m.IPBlacklist,
-		LastUsedAt:    m.LastUsedAt,
-		CreatedAt:     m.CreatedAt,
-		UpdatedAt:     m.UpdatedAt,
-		GroupID:       m.GroupID,
-		Quota:         m.Quota,
-		QuotaUsed:     m.QuotaUsed,
-		ExpiresAt:     m.ExpiresAt,
-		RateLimit5h:   m.RateLimit5h,
-		RateLimit1d:   m.RateLimit1d,
-		RateLimit7d:   m.RateLimit7d,
-		Usage5h:       m.Usage5h,
-		Usage1d:       m.Usage1d,
-		Usage7d:       m.Usage7d,
-		Window5hStart: m.Window5hStart,
-		Window1dStart: m.Window1dStart,
-		Window7dStart: m.Window7dStart,
+		ID:               m.ID,
+		UserID:           m.UserID,
+		Key:              m.Key,
+		Name:             m.Name,
+		Status:           m.Status,
+		IPWhitelist:      m.IPWhitelist,
+		IPBlacklist:      m.IPBlacklist,
+		LastUsedAt:       m.LastUsedAt,
+		CreatedAt:        m.CreatedAt,
+		UpdatedAt:        m.UpdatedAt,
+		GroupID:          m.GroupID,
+		Quota:            m.Quota,
+		QuotaUsed:        m.QuotaUsed,
+		ExpiresAt:        m.ExpiresAt,
+		RateLimit5h:      m.RateLimit5h,
+		ConcurrencyLimit: m.ConcurrencyLimit,
+		RateLimit1d:      m.RateLimit1d,
+		RateLimit7d:      m.RateLimit7d,
+		Usage5h:          m.Usage5h,
+		Usage1d:          m.Usage1d,
+		Usage7d:          m.Usage7d,
+		Window5hStart:    m.Window5hStart,
+		Window1dStart:    m.Window1dStart,
+		Window7dStart:    m.Window7dStart,
 	}
 	if m.Edges.User != nil {
 		out.User = userEntityToService(m.Edges.User)

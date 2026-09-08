@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -672,6 +673,28 @@ func (c *concurrencyCache) TrackAPIKeySlot(ctx context.Context, apiKeyID int64, 
 func (c *concurrencyCache) ReleaseAPIKeySlot(ctx context.Context, apiKeyID int64, requestID string) error {
 	key := apiKeySlotKey(apiKeyID)
 	return c.rdb.ZRem(ctx, key, requestID).Err()
+}
+
+func (c *concurrencyCache) APIKeySlotRefreshInterval() time.Duration {
+	return time.Duration(c.slotTTLSeconds) * time.Second / 3
+}
+
+// Refresh only an existing member, atomically with its key TTL. In particular,
+// admin deletion must not be undone by a late heartbeat.
+var refreshAPIKeySlotScript = redis.NewScript(`
+	redis.replicate_commands()
+	if redis.call('ZSCORE', KEYS[1], ARGV[2]) == false then
+		return 0
+	end
+	local now = redis.call('TIME')
+	redis.call('ZADD', KEYS[1], 'XX', tonumber(now[1]), ARGV[2])
+	redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+	return 1
+`)
+
+func (c *concurrencyCache) RefreshAPIKeySlot(ctx context.Context, apiKeyID int64, requestID string) (bool, error) {
+	n, err := refreshAPIKeySlotScript.Run(ctx, c.rdb, []string{apiKeySlotKey(apiKeyID)}, c.slotTTLSeconds, requestID).Int()
+	return n == 1, err
 }
 
 func (c *concurrencyCache) AcquireOpenAIWSIngressLease(ctx context.Context, apiKeyID int64, maxConnections int, leaseID string) (bool, error) {

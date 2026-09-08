@@ -186,32 +186,29 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		return nil, fmt.Errorf("prepare http bridge body: %w", err)
 	}
 
-	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+	upstreamCtx, startDrain, releaseUpstreamCtx := openAIWSDrainContext(ctx)
+	defer releaseUpstreamCtx()
 	var upstreamReq *http.Request
 	if account.Platform == PlatformGrok {
 		upstreamModel := resolveGrokWSUpstreamModel(account, body, originalModel)
 		grokIntentSourceBody := body
 		body, err = patchGrokResponsesBody(body, upstreamModel)
 		if err != nil {
-			releaseUpstreamCtx()
 			return nil, err
 		}
 		grokMixedCacheIntentBody := append([]byte(nil), body...)
 		body, err = applyGrokResponsesCacheIdentity(body, grokIntentSourceBody, grokCacheIdentity, account.IsGrokOAuth())
 		if err != nil {
-			releaseUpstreamCtx()
 			return nil, fmt.Errorf("apply grok prompt cache identity: %w", err)
 		}
 		body, err = applyGrokFreeRequestToolCacheRoute(c, body, grokMixedCacheIntentBody, account, grokCacheIdentity)
 		if err != nil {
-			releaseUpstreamCtx()
 			return nil, fmt.Errorf("apply grok Free function-tool cache route: %w", err)
 		}
 		upstreamReq, err = buildGrokResponsesRequest(upstreamCtx, c, account, body, token, grokCacheIdentity, s.cfg)
 	} else {
 		upstreamReq, err = s.buildUpstreamRequestOpenAIPassthrough(upstreamCtx, c, account, body, token)
 	}
-	releaseUpstreamCtx()
 	if err != nil {
 		return nil, err
 	}
@@ -231,6 +228,9 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	turnStart := time.Now()
 	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 	if err != nil {
+		if upstreamCtx.Err() != nil {
+			return nil, context.Cause(upstreamCtx)
+		}
 		if turn == 1 {
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
 		}
@@ -239,6 +239,9 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		return nil, fmt.Errorf("upstream http bridge request failed: %s", safeErr)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	// Canceling upstreamCtx interrupts the HTTP transport read. The scanner's
+	// goroutine alone closes Body afterwards: decompressor Close is not safe
+	// concurrently with Read (including the repository's gzip/deflate wrappers).
 
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, openAIWSHTTPBridgeErrorBodyLimitBytes))
@@ -422,6 +425,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			if err := writeClientMessage(upstreamMessage); err != nil {
 				if isOpenAIWSClientDisconnectError(err) {
 					clientDisconnected = true
+					startDrain()
 					closeStatus, closeReason := summarizeOpenAIWSReadCloseError(err)
 					logOpenAIWSModeInfo(
 						"ingress_ws_http_bridge_client_disconnected_drain account_id=%d turn=%d close_status=%s close_reason=%s",
@@ -472,6 +476,9 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	}
 	if err := scanner.Err(); err != nil {
 		streamErr := fmt.Errorf("read upstream http bridge stream: %w", err)
+		if upstreamCtx.Err() != nil {
+			return resultWithUsage(), context.Cause(upstreamCtx)
+		}
 		if turn == 1 && !wroteDownstream {
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, streamErr, true)
 		}

@@ -41,6 +41,40 @@ type closeSpyFrameConn struct {
 	closeCalls atomic.Int32
 }
 
+type drainErrorFrameConn struct {
+	FrameConn
+	draining <-chan struct{}
+	err      error
+}
+
+func (c *drainErrorFrameConn) ReadFrame(ctx context.Context) (coderws.MessageType, []byte, error) {
+	select {
+	case <-c.draining:
+		return 0, nil, c.err
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
+}
+
+func TestRelayClientDisconnectPreservesUpstreamDrainError(t *testing.T) {
+	draining := make(chan struct{})
+	upstreamErr := errors.New("upstream failed during usage drain")
+	client := newPassthroughTestFrameConn(nil, true)
+	upstream := &drainErrorFrameConn{FrameConn: newPassthroughTestFrameConn(nil, false), draining: draining, err: upstreamErr}
+	_, exit := Relay(context.Background(), client, upstream, []byte(`{"type":"response.create"}`), RelayOptions{
+		FirstMessageSent:     true,
+		UpstreamDrainTimeout: time.Second,
+		OnTrace: func(event RelayTraceEvent) {
+			if event.Stage == "first_exit" {
+				close(draining)
+			}
+		},
+	})
+	require.NotNil(t, exit)
+	require.Equal(t, "read_upstream", exit.Stage)
+	require.ErrorIs(t, exit.Err, upstreamErr)
+}
+
 func newPassthroughTestFrameConn(frames []passthroughTestFrame, autoClose bool) *passthroughTestFrameConn {
 	c := &passthroughTestFrameConn{
 		readCh: make(chan passthroughTestFrame, len(frames)+1),

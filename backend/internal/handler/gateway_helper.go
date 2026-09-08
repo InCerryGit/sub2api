@@ -215,6 +215,16 @@ func (h *ConcurrencyHelper) TryAcquireUserSlotForAPIKey(ctx context.Context, use
 	return h.withAPIKeySlot(ctx, apiKeyID, releaseFunc), true, nil
 }
 
+// WS acquisition still observes cancellation. Once acquired, tracking belongs
+// to the turn owner, which releases only after upstream forwarding has stopped.
+func (h *ConcurrencyHelper) TryAcquireWSUserSlotForAPIKey(ctx context.Context, userID int64, maxConcurrency int, apiKeyID int64) (func(), bool, error) {
+	releaseFunc, acquired, err := h.TryAcquireUserSlot(ctx, userID, maxConcurrency)
+	if err != nil || !acquired {
+		return releaseFunc, acquired, err
+	}
+	return sync.OnceFunc(h.withAPIKeySlot(context.WithoutCancel(ctx), apiKeyID, releaseFunc)), true, nil
+}
+
 // AcquireOpenAIWSIngressLease bounds the whole client WebSocket lifecycle,
 // independently from per-turn user and account slots.
 func (h *ConcurrencyHelper) AcquireOpenAIWSIngressLease(ctx context.Context, apiKeyID int64, maxConnections int) (*service.OpenAIWSIngressLease, bool, error) {

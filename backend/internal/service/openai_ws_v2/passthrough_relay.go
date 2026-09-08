@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -211,39 +212,48 @@ func Relay(
 	exitCh := make(chan relayExitSignal, 3)
 	dropDownstreamWrites := atomic.Bool{}
 	clientReaderStarted := atomic.Bool{}
+	var readers sync.WaitGroup
 	startClientReader := func() {
 		if !clientReaderStarted.CompareAndSwap(false, true) {
 			return
 		}
-		go runClientToUpstream(relayCtx, clientConn, options.ReadClientFrame, writeUpstream, markActivity, clientToUpstreamFrames, onTrace, exitCh)
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			runClientToUpstream(relayCtx, clientConn, options.ReadClientFrame, writeUpstream, markActivity, clientToUpstreamFrames, onTrace, exitCh)
+		}()
 	}
 	if !options.StartClientAfterFirstDownstream {
 		startClientReader()
 	}
-	go runUpstreamToClient(
-		relayCtx,
-		upstreamConn,
-		writeClient,
-		startAt,
-		nowFn,
-		state,
-		options.OnUsageParseFailure,
-		options.OnTurnComplete,
-		options.BeforeWriteClient,
-		options.BeforeClientWrite,
-		options.AfterClientWrite,
-		func(msgType coderws.MessageType, payload []byte) {
-			if options.StartClientAfterFirstDownstream {
-				startClientReader()
-			}
-		},
-		&dropDownstreamWrites,
-		upstreamToClientFrames,
-		droppedDownstreamFrames,
-		markActivity,
-		onTrace,
-		exitCh,
-	)
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		runUpstreamToClient(
+			relayCtx,
+			upstreamConn,
+			writeClient,
+			startAt,
+			nowFn,
+			state,
+			options.OnUsageParseFailure,
+			options.OnTurnComplete,
+			options.BeforeWriteClient,
+			options.BeforeClientWrite,
+			options.AfterClientWrite,
+			func(msgType coderws.MessageType, payload []byte) {
+				if options.StartClientAfterFirstDownstream {
+					startClientReader()
+				}
+			},
+			&dropDownstreamWrites,
+			upstreamToClientFrames,
+			droppedDownstreamFrames,
+			markActivity,
+			onTrace,
+			exitCh,
+		)
+	}()
 	go runIdleWatchdog(relayCtx, nowFn, options.IdleTimeout, &lastActivity, onTrace, exitCh)
 
 	firstExit := <-exitCh
@@ -297,12 +307,13 @@ func Relay(
 
 	relayCancel()
 	_ = upstreamConn.Close()
+	readers.Wait()
 
 	enrichResult(&result, state, nowFn().Sub(startAt))
 	result.ClientToUpstreamFrames = clientToUpstreamFrames.Load()
 	result.UpstreamToClientFrames = upstreamToClientFrames.Load()
 	result.DroppedDownstreamFrames = droppedDownstreamFrames.Load()
-	if options.FirstMessageSent && firstExit.stage == "read_client" && firstExit.graceful {
+	if options.FirstMessageSent && firstExit.stage == "read_client" && firstExit.graceful && (!hasSecondExit || secondExit.graceful) {
 		emitRelayTrace(onTrace, RelayTraceEvent{
 			Stage:           "relay_client_closed",
 			Graceful:        true,

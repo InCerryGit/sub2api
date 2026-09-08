@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,6 +22,7 @@ import (
 
 type openAIWSClientFrameConn struct {
 	conn                 *coderws.Conn
+	reader               *openAIWSIngressReader
 	controlCtx           context.Context
 	interTurnIdleTimeout time.Duration
 	interTurnStarted     chan struct{}
@@ -541,6 +543,40 @@ func (c *openAIWSClientFrameConn) ReadFrame(ctx context.Context) (coderws.Messag
 	if c == nil || c.conn == nil {
 		return coderws.MessageText, nil, errOpenAIWSConnClosed
 	}
+	if c.reader != nil {
+		var timer *time.Timer
+		var timeout <-chan time.Time
+		defer func() {
+			if timer != nil {
+				timer.Stop()
+			}
+		}()
+		for {
+			if timeout == nil && c.waitingForNextTurn.Load() && c.interTurnIdleTimeout > 0 {
+				timer = time.NewTimer(c.interTurnIdleTimeout)
+				timeout = timer.C
+			}
+			select {
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			case <-c.reader.done:
+				if c.reader.disconnected() {
+					// Every peer close ends the input stream, including policy
+					// and application codes. Keep its original close evidence.
+					return 0, nil, errors.Join(io.EOF, c.reader.err)
+				}
+				return 0, nil, c.reader.err
+			case frame := <-c.reader.frames:
+				return frame.messageType, frame.payload, nil
+			case <-c.interTurnStarted:
+			case <-timeout:
+				if c.waitingForNextTurn.Load() {
+					return 0, nil, NewOpenAIWSClientCloseError(coderws.StatusNormalClosure, "websocket idle timeout", context.DeadlineExceeded)
+				}
+				timeout = nil
+			}
+		}
+	}
 	controlCtx := ctx
 	if c.controlCtx != nil {
 		controlCtx = c.controlCtx
@@ -656,6 +692,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	// model would miss any admin-configured model whitelist and be silently
 	// passed through, defeating that policy on every frame after the first.
 	capturedSessionModel := openAIWSPassthroughPolicyModelForFrame(account, firstClientMessage)
+	var activePolicyModel atomic.Pointer[string]
+	initialPolicyModel := capturedSessionModel
+	activePolicyModel.Store(&initialPolicyModel)
 	initialRequestModel := ""
 	if hooks != nil {
 		initialRequestModel = hooks.InitialRequestModel
@@ -833,9 +872,20 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 
 	completedTurns := atomic.Int32{}
+	activeTurn := atomic.Int32{}
+	activeTurn.Store(1)
+	// Relay joins both directions before returning, so no completion can race
+	// this fallback. Close upstream before releasing an unfinished turn.
+	defer func() {
+		_ = upstreamConn.Close()
+		if turn := activeTurn.Swap(0); turn != 0 && hooks != nil && hooks.AfterTurn != nil {
+			hooks.AfterTurn(int(turn), nil, errors.New("websocket turn ended before terminal event"))
+		}
+	}()
 	turnLifecycle := newOpenAIWSPassthroughTurnLifecycle(true)
 	clientFrameConn := &openAIWSClientFrameConn{
 		conn:                 clientConn,
+		reader:               openAIWSGetIngressReader(c, clientConn),
 		controlCtx:           ctx,
 		interTurnIdleTimeout: s.openAIWSIngressInterTurnIdleTimeout(),
 		interTurnStarted:     make(chan struct{}, 1),
@@ -928,6 +978,14 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			//     覆盖（Store(nil)），因为 OpenAI 上游对该帧实际不传
 			//     service_tier 时按 default 处理，billing 应如实反映。
 			if policyErr == nil && blocked == nil && isResponseCreate {
+				turnNo := int(completedTurns.Load()) + 1
+				if hooks != nil && hooks.BeforeTurn != nil {
+					if err := hooks.BeforeTurn(turnNo); err != nil {
+						return payload, nil, err
+					}
+				}
+				activeTurn.Store(int32(turnNo))
+				activePolicyModel.Store(&model)
 				usageMeta.updateFromResponseCreate(out, model, requestModelForThisFrame)
 				acceptedTurn = true
 			}
@@ -988,7 +1046,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			IdleTimeout:                     0,
 			FirstMessageType:                coderws.MessageText,
 			FirstMessageSent:                upstreamFirstMessageSent,
-			StartClientAfterFirstDownstream: true,
+			StartClientAfterFirstDownstream: false,
 			ReadClientFrame:                 readNextClientFrame,
 			OnUsageParseFailure: func(eventType string, usageRaw string) {
 				logOpenAIWSV2Passthrough(
@@ -998,6 +1056,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				)
 			},
 			OnTurnComplete: func(turn openaiwsv2.RelayTurnResult) {
+				if activeTurn.Swap(0) == 0 {
+					return
+				}
 				turnNo := int(completedTurns.Add(1))
 				turnResult := &OpenAIForwardResult{
 					RequestID: turn.RequestID,
@@ -1061,10 +1122,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}
 				eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
 				if isOpenAIWSTerminalEvent(eventType) {
-					s.handleOpenAIWSTerminalTransientFailure(ctx, account, capturedSessionModel, handshakeHeaders, payload)
+					s.handleOpenAIWSTerminalTransientFailure(ctx, account, *activePolicyModel.Load(), handshakeHeaders, payload)
 				}
 				if eventType == "error" {
-					s.handleOpenAIWSErrorEventTransientFailure(ctx, account, capturedSessionModel, handshakeHeaders, payload)
+					s.handleOpenAIWSErrorEventTransientFailure(ctx, account, *activePolicyModel.Load(), handshakeHeaders, payload)
 				}
 				if wroteDownstream || eventType != "error" {
 					return nil
@@ -1103,15 +1164,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		},
 	})
 	if cause := context.Cause(ctx); cause != nil {
-		status := coderws.StatusGoingAway
-		reason := "websocket request canceled"
-		if errors.Is(cause, ErrOpenAIWSIngressLeaseLost) {
-			status = coderws.StatusTryAgainLater
-			reason = "websocket ingress capacity lease lost; please reconnect"
+		controlErr := clientFrameConn.reader.closeForControl(ctx)
+		if turn := activeTurn.Swap(0); turn != 0 && hooks != nil && hooks.AfterTurn != nil {
+			hooks.AfterTurn(int(turn), nil, controlErr)
 		}
-		_ = clientConn.Close(status, reason)
-		_ = clientConn.CloseNow()
-		return NewOpenAIWSClientCloseError(status, reason, cause)
+		return controlErr
 	}
 
 	result := &OpenAIForwardResult{
@@ -1147,9 +1204,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			relayResult.DroppedDownstreamFrames,
 			turnCount,
 		)
-		// 正常路径按 terminal 事件逐 turn 已回调；仅在零 turn 场景兜底回调一次。
-		if turnCount == 0 && hooks != nil && hooks.AfterTurn != nil {
-			hooks.AfterTurn(1, result, nil)
+		if clientFrameConn.reader.disconnected() {
+			if turn := activeTurn.Swap(0); turn != 0 && hooks != nil && hooks.AfterTurn != nil {
+				hooks.AfterTurn(int(turn), nil, nil)
+			}
 		}
 		return nil
 	}
@@ -1214,8 +1272,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		relayErr,
 		relayExit.WroteDownstream,
 	)
-	if hooks != nil && hooks.AfterTurn != nil {
-		hooks.AfterTurn(turnCount+1, nil, turnErr)
+	if turn := activeTurn.Swap(0); turn != 0 && hooks != nil && hooks.AfterTurn != nil {
+		hooks.AfterTurn(int(turn), nil, turnErr)
 	}
 	return turnErr
 }
