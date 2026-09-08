@@ -173,7 +173,9 @@ func TestAPIKeyAdmissionModelsColdCancellationJoinsWithoutCancelingPeer(t *testi
 				response, err := s.FetchCodexModelsManifest(peerCtx, account, "", "")
 				peerDone <- admissionModelsResult{response, err}
 			}()
-			ctx.Value(apiKeyAdmissionOwnerKey{}).(*apiKeyAdmissionOwner).cancel(ErrAPIKeySlotLeaseLost)
+			owner, ok := apiKeyAdmissionOwnerFromContext(ctx)
+			require.True(t, ok)
+			owner.cancel(ErrAPIKeySlotLeaseLost)
 			select {
 			case <-firstStopped:
 			case <-time.After(time.Second):

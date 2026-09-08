@@ -438,7 +438,8 @@ func (s *ConcurrencyService) AcquireAPIKeySlot(ctx context.Context, apiKeyID int
 	}
 	requestID := generateRequestID()
 	leaseCache, ok := s.cache.(APIKeySlotLeaseCache)
-	if !ok || leaseCache.APIKeySlotTTL() <= 2*time.Second || leaseCache.APIKeySlotRefreshInterval() <= 0 || !HasAPIKeyAdmissionOwner(ctx) {
+	owner, ownerOK := apiKeyAdmissionOwnerFromContext(ctx)
+	if !ok || leaseCache.APIKeySlotTTL() <= 2*time.Second || leaseCache.APIKeySlotRefreshInterval() <= 0 || !ownerOK {
 		return nil, fmt.Errorf("API key concurrency requires a renewable lease and cancellation owner")
 	}
 	started := time.Now()
@@ -453,7 +454,7 @@ func (s *ConcurrencyService) AcquireAPIKeySlot(ctx context.Context, apiKeyID int
 	if !acquired {
 		return &AcquireResult{Acquired: false}, nil
 	}
-	return &AcquireResult{Acquired: true, ReleaseFunc: keepEnforcedAPIKeySlot(ctx, leaseCache, apiKeyID, requestID, started)}, nil
+	return &AcquireResult{Acquired: true, ReleaseFunc: keepEnforcedAPIKeySlot(owner, leaseCache, apiKeyID, requestID, started)}, nil
 }
 
 // TrackAPIKeySlot records one active request slot for an API key without

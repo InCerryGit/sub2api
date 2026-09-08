@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
-	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/Wei-Shaw/sub2api/internal/testutil"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -92,7 +92,10 @@ func TestWSHTTPBridgeCompressedCancellationClosesBeforeSlotRelease(t *testing.T)
 					}
 					_, _ = io.WriteString(compressed, ": keepalive\n\n")
 					_ = compressed.Flush()
-					w.(http.Flusher).Flush()
+					if err := http.NewResponseController(w).Flush(); err != nil {
+						t.Errorf("flush compressed upstream response: %v", err)
+						return
+					}
 					// No terminal event and no compressor trailer: the next SSE
 					// read stalls until the actual HTTP request is canceled.
 					<-r.Context().Done()
@@ -108,7 +111,7 @@ func TestWSHTTPBridgeCompressedCancellationClosesBeforeSlotRelease(t *testing.T)
 				var allowOnce sync.Once
 				allowClose := func() { allowOnce.Do(func() { close(body.allowClose) }) }
 				defer allowClose()
-				transport := &bridgeRealTransport{HTTPUpstream: repository.NewHTTPUpstream(cfg), encoding: encoding, body: body}
+				transport := &bridgeRealTransport{HTTPUpstream: testutil.NewRealHTTPUpstream(cfg), encoding: encoding, body: body}
 				svc := service.NewOpenAIGatewayService(nil, nil, nil, nil, nil, nil, nil, cfg, nil, nil, nil, nil, nil, transport, nil, nil, nil, nil, nil, nil, nil, nil)
 				account := &service.Account{ID: 1, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Concurrency: 1,
 					Credentials: map[string]any{"base_url": upstream.URL, "api_key": "sk-test"},
@@ -125,7 +128,7 @@ func TestWSHTTPBridgeCompressedCancellationClosesBeforeSlotRelease(t *testing.T)
 						done <- err
 						return
 					}
-					defer conn.CloseNow()
+					defer func() { _ = conn.CloseNow() }()
 					release, acquired, err := helper.TryAcquireWSUserSlotForAPIKey(ctx, 202, 3, 77, 0)
 					if err != nil || !acquired {
 						done <- err
@@ -141,7 +144,7 @@ func TestWSHTTPBridgeCompressedCancellationClosesBeforeSlotRelease(t *testing.T)
 				defer func() { cancel(); allowClose(); gateway.Close() }()
 				client, _, err := coderws.Dial(context.Background(), "ws"+strings.TrimPrefix(gateway.URL, "http"), nil)
 				require.NoError(t, err)
-				defer client.CloseNow()
+				defer func() { _ = client.CloseNow() }()
 				select {
 				case <-body.readStarted:
 				case err := <-done:

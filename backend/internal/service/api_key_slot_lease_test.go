@@ -72,8 +72,36 @@ func TestAPIKeyAdmissionDetachedBuilderReleasePreservesOwner(t *testing.T) {
 	release() // Existing builders release before httpUpstream.Do.
 	require.NoError(t, upstream.Err())
 	require.Equal(t, "latest routing decision", upstream.Value(routingKey{}))
-	ctx.Value(apiKeyAdmissionOwnerKey{}).(*apiKeyAdmissionOwner).cancel(ErrAPIKeySlotLeaseLost)
+	owner, ok := apiKeyAdmissionOwnerFromContext(ctx)
+	require.True(t, ok)
+	owner.cancel(ErrAPIKeySlotLeaseLost)
 	require.ErrorIs(t, context.Cause(upstream), ErrAPIKeySlotLeaseLost)
+}
+
+func TestAPIKeyAdmissionRejectsInvalidCancellationOwner(t *testing.T) {
+	for name, ctx := range map[string]context.Context{
+		"nil context":     nil,
+		"absent":          context.Background(),
+		"wrong type":      context.WithValue(context.Background(), apiKeyAdmissionOwnerKey{}, "invalid"),
+		"typed nil":       context.WithValue(context.Background(), apiKeyAdmissionOwnerKey{}, (*apiKeyAdmissionOwner)(nil)),
+		"missing control": context.WithValue(context.Background(), apiKeyAdmissionOwnerKey{}, &apiKeyAdmissionOwner{cancel: func(error) {}}),
+		"missing cancel":  context.WithValue(context.Background(), apiKeyAdmissionOwnerKey{}, &apiKeyAdmissionOwner{ctx: context.Background()}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.False(t, HasAPIKeyAdmissionOwner(ctx))
+			require.False(t, APIKeySlotLeaseLost(ctx))
+			cache := &apiKeyAdmissionLifecycleCache{}
+			result, err := NewConcurrencyService(cache).AcquireAPIKeySlot(ctx, 8, 1)
+			require.Error(t, err)
+			require.Nil(t, result)
+			require.Empty(t, cache.id, "invalid owners must fail before Redis admission")
+			if ctx != nil {
+				repaired, cancel := WithAPIKeyAdmissionOwner(ctx)
+				defer cancel()
+				require.True(t, HasAPIKeyAdmissionOwner(repaired))
+			}
+		})
+	}
 }
 
 func TestAPIKeyAdmissionLeaseLossCancelsDetachedHTTPTransport(t *testing.T) {

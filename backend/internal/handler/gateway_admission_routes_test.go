@@ -19,7 +19,7 @@ import (
 func TestAPIKeyAdmissionRealForwardingHandlersRejectBeforeUpstream(t *testing.T) {
 	upstream := &openAIResponsesFailoverCancelUpstream{}
 	h := newOpenAIResponsesFailoverTestHandler(t, upstream)
-	helper, _, _ := newAPIKeyAdmissionHelper(t)
+	helper, _ := newAPIKeyAdmissionHelper(t)
 	h.concurrencyHelper = helper
 	ctx, cancel := service.WithAPIKeyAdmissionOwner(context.Background())
 	defer cancel()
@@ -59,7 +59,7 @@ func TestAPIKeyAdmissionRealForwardingHandlersRejectBeforeUpstream(t *testing.T)
 }
 
 func TestAPIKeyAdmissionPrecedesUserQueueAndSSE(t *testing.T) {
-	helper, _, _ := newAPIKeyAdmissionHelper(t)
+	helper, _ := newAPIKeyAdmissionHelper(t)
 	helper.pingFormat = SSEPingFormatComment
 	ctx, cancel := service.WithAPIKeyAdmissionOwner(context.Background())
 	defer cancel()
@@ -82,7 +82,7 @@ func TestAPIKeyAdmissionPrecedesUserQueueAndSSE(t *testing.T) {
 }
 
 func TestAPIKeyAdmissionCanceledUserWaitReturnsReservation(t *testing.T) {
-	helper, cache, _ := newAPIKeyAdmissionHelper(t)
+	helper, cache := newAPIKeyAdmissionHelper(t)
 	userRelease, acquired, err := helper.TryAcquireUserSlot(context.Background(), 1, 1)
 	require.NoError(t, err)
 	require.True(t, acquired)

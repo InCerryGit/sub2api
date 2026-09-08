@@ -46,7 +46,7 @@ func TestOpenAIWSIngressInterTurnControlClose(t *testing.T) {
 				server, done := startPassthroughLifecycleServer(t, ctx, svc, account, &OpenAIWSIngressHooks{AfterTurn: func(_ int, _ *OpenAIForwardResult, err error) { after <- err }})
 				defer server.Close()
 				client := dialPassthroughLifecycleClient(t, server)
-				defer client.CloseNow()
+				defer func() { _ = client.CloseNow() }()
 				if mode == OpenAIWSIngressModeCtxPool {
 					requirePassthroughUpstreamWrite(t, upstream, time.Second)
 					upstream.Send(terminal)
@@ -96,7 +96,7 @@ func TestOpenAIWSIngressReaderOverflowSendsPolicyCloseAndJoins(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.CloseNow()
+		defer func() { _ = conn.CloseNow() }()
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
 		r := openAIWSGetIngressReader(c, conn)
 		readers <- r
@@ -105,7 +105,7 @@ func TestOpenAIWSIngressReaderOverflowSendsPolicyCloseAndJoins(t *testing.T) {
 	defer server.Close()
 	client, _, err := coderws.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 	require.NoError(t, err)
-	defer client.CloseNow()
+	defer func() { _ = client.CloseNow() }()
 	r := <-readers
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
@@ -139,7 +139,7 @@ func TestOpenAIWSIngressDisconnectKeepsUpstreamFailure(t *testing.T) {
 			svc := newPassthroughLifecycleService(cfg, upstream)
 			svc.openaiWSPool = pool
 			body, writer := io.Pipe()
-			defer writer.Close()
+			defer func() { _ = writer.Close() }()
 			svc.httpUpstream = &contextAwareBridgeUpstream{httpUpstreamRecorder: httpUpstreamRecorder{resp: &http.Response{StatusCode: 200, Header: make(http.Header), Body: body}}, writer: writer}
 			account := passthroughLifecycleAccount()
 			account.Extra["openai_apikey_responses_websockets_v2_mode"] = mode
@@ -147,7 +147,7 @@ func TestOpenAIWSIngressDisconnectKeepsUpstreamFailure(t *testing.T) {
 			server, done := startPassthroughLifecycleServer(t, context.Background(), svc, account, &OpenAIWSIngressHooks{AfterTurn: func(_ int, _ *OpenAIForwardResult, err error) { after <- err }})
 			defer server.Close()
 			client := dialPassthroughLifecycleClient(t, server)
-			defer client.CloseNow()
+			defer func() { _ = client.CloseNow() }()
 			if mode == OpenAIWSIngressModeCtxPool {
 				requirePassthroughUpstreamWrite(t, upstream, time.Second)
 			} else {

@@ -42,7 +42,7 @@ func TestOpenAIWSHTTPBridgeCompletedUsageSurvivesControlCancel(t *testing.T) {
 	server, done := startPassthroughLifecycleServer(t, ctx, svc, account, &OpenAIWSIngressHooks{AfterTurn: func(_ int, result *OpenAIForwardResult, err error) { results <- result; turnErrors <- err }})
 	defer server.Close()
 	client := dialPassthroughLifecycleClient(t, server)
-	defer client.CloseNow()
+	defer func() { _ = client.CloseNow() }()
 	_, err := readPassthroughLifecycleFrame(t, client, 3*time.Second)
 	require.NoError(t, err)
 	_, err = readPassthroughLifecycleFrame(t, client, 3*time.Second)
@@ -76,7 +76,7 @@ func TestOpenAIWSProxyPeerCloseCodesDrainCleanly(t *testing.T) {
 				svc := newPassthroughLifecycleService(cfg, upstream)
 				svc.openaiWSPool = pool
 				body, writer := io.Pipe()
-				defer writer.Close()
+				defer func() { _ = writer.Close() }()
 				svc.httpUpstream = &contextAwareBridgeUpstream{httpUpstreamRecorder: httpUpstreamRecorder{resp: &http.Response{StatusCode: 200, Header: make(http.Header), Body: body}}, writer: writer}
 				account := passthroughLifecycleAccount()
 				account.Extra["openai_apikey_responses_websockets_v2_mode"] = mode
@@ -85,7 +85,7 @@ func TestOpenAIWSProxyPeerCloseCodesDrainCleanly(t *testing.T) {
 				server, done := startPassthroughLifecycleServer(t, context.Background(), svc, account, &OpenAIWSIngressHooks{AfterTurn: func(_ int, result *OpenAIForwardResult, err error) { results <- result; turnErrors <- err }})
 				defer server.Close()
 				client := dialPassthroughLifecycleClient(t, server)
-				defer client.CloseNow()
+				defer func() { _ = client.CloseNow() }()
 				if mode != OpenAIWSIngressModeHTTPBridge {
 					requirePassthroughUpstreamWrite(t, upstream, time.Second)
 				} else {
@@ -155,7 +155,7 @@ func TestOpenAIWSFailoverGateRejectsDepartedClient(t *testing.T) {
 						done <- err
 						return
 					}
-					defer conn.CloseNow()
+					defer func() { _ = conn.CloseNow() }()
 					c, _ := gin.CreateTestContext(httptest.NewRecorder())
 					c.Request = req
 					readers <- openAIWSGetIngressReader(c, conn)
@@ -179,7 +179,7 @@ func TestOpenAIWSFailoverGateRejectsDepartedClient(t *testing.T) {
 				defer server.Close()
 				client, _, err := coderws.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 				require.NoError(t, err)
-				defer client.CloseNow()
+				defer func() { _ = client.CloseNow() }()
 				r := <-readers
 				if mode == OpenAIWSIngressModeHTTPBridge {
 					<-httpStarted
@@ -229,4 +229,20 @@ func TestOpenAIWSFailoverGateRejectsControlAndPolicyClose(t *testing.T) {
 	close(done)
 	c.Set(openAIWSIngressReaderKey, &openAIWSIngressReader{done: done, err: NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "too many pending websocket requests", nil)})
 	require.False(t, OpenAIWSIngressCanFailover(context.Background(), c))
+}
+
+func TestOpenAIWSFailoverGateRejectsInvalidReaderState(t *testing.T) {
+	for _, value := range []any{"invalid", (*openAIWSIngressReader)(nil)} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Set(openAIWSIngressReaderKey, value)
+		require.False(t, OpenAIWSIngressCanFailover(context.Background(), c))
+		reader := openAIWSGetIngressReader(c, nil)
+		require.Error(t, reader.err)
+		select {
+		case <-reader.done:
+		default:
+			t.Fatal("invalid cached state must not start another reader")
+		}
+		require.Same(t, reader, openAIWSGetIngressReader(c, nil))
+	}
 }

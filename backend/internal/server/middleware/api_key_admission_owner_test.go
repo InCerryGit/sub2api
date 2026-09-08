@@ -104,7 +104,7 @@ func TestAPIKeyAdmissionOwnerGinFinalizationAndImplicitWrites(t *testing.T) {
 				response := httptest.NewRecorder()
 				router.ServeHTTP(response, httptest.NewRequest(method, "/forward", nil))
 				result := response.Result()
-				defer result.Body.Close()
+				defer func() { _ = result.Body.Close() }()
 				require.Equal(t, http.StatusServiceUnavailable, result.StatusCode)
 				require.Equal(t, "application/json; charset=utf-8", result.Header.Get("Content-Type"))
 				require.Empty(t, result.Header.Get("Content-Encoding"))

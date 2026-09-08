@@ -33,23 +33,36 @@ func WithAPIKeyAdmissionOwner(ctx context.Context) (context.Context, context.Can
 }
 
 func HasAPIKeyAdmissionOwner(ctx context.Context) bool {
-	return ctx != nil && ctx.Value(apiKeyAdmissionOwnerKey{}) != nil
+	_, ok := apiKeyAdmissionOwnerFromContext(ctx)
+	return ok
+}
+
+func apiKeyAdmissionOwnerFromContext(ctx context.Context) (*apiKeyAdmissionOwner, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	owner, ok := ctx.Value(apiKeyAdmissionOwnerKey{}).(*apiKeyAdmissionOwner)
+	if !ok || owner == nil || owner.ctx == nil || owner.cancel == nil {
+		return nil, false
+	}
+	return owner, true
 }
 
 func APIKeySlotLeaseLost(ctx context.Context) bool {
-	if !HasAPIKeyAdmissionOwner(ctx) {
+	owner, ok := apiKeyAdmissionOwnerFromContext(ctx)
+	if !ok {
 		return false
 	}
-	return errors.Is(context.Cause(ctx.Value(apiKeyAdmissionOwnerKey{}).(*apiKeyAdmissionOwner).ctx), ErrAPIKeySlotLeaseLost)
+	return errors.Is(context.Cause(owner.ctx), ErrAPIKeySlotLeaseLost)
 }
 
 // Detach client cancellation, but never detach the capacity owner's stop signal.
 func detachAPIKeyUpstreamContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	base := context.WithoutCancel(ctx)
-	if !HasAPIKeyAdmissionOwner(ctx) {
+	owner, ok := apiKeyAdmissionOwnerFromContext(ctx)
+	if !ok {
 		return base, func() {}
 	}
-	owner := ctx.Value(apiKeyAdmissionOwnerKey{}).(*apiKeyAdmissionOwner)
 	// Existing builders release immediately after constructing a request. Keep
 	// that no-op release contract: the auth owner, not the builder, owns lifetime.
 	return apiKeyUpstreamContext{Context: owner.ctx, values: base}, func() {}
@@ -79,8 +92,7 @@ type APIKeySlotLeaseCache interface {
 // START of the last acknowledged Redis operation, never on a failed renewal or
 // delayed reply. Reserve one second for Redis TIME rounding PLUS one third of
 // TTL for transport shutdown before Redis can admit another owner.
-func keepEnforcedAPIKeySlot(ctx context.Context, cache APIKeySlotLeaseCache, keyID int64, requestID string, acknowledgedAt time.Time) func() {
-	owner := ctx.Value(apiKeyAdmissionOwnerKey{}).(*apiKeyAdmissionOwner)
+func keepEnforcedAPIKeySlot(owner *apiKeyAdmissionOwner, cache APIKeySlotLeaseCache, keyID int64, requestID string, acknowledgedAt time.Time) func() {
 	ttl := cache.APIKeySlotTTL()
 	margin := ttl/3 + time.Second
 	validFor := ttl - margin

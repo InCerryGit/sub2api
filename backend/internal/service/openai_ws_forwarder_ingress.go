@@ -48,8 +48,12 @@ func OpenAIWSIngressCanFailover(ctx context.Context, c *gin.Context) bool {
 		return false
 	}
 	if value, ok := c.Get(openAIWSIngressReaderKey); ok {
+		reader, valid := value.(*openAIWSIngressReader)
+		if !valid || reader == nil {
+			return false
+		}
 		select {
-		case <-value.(*openAIWSIngressReader).done:
+		case <-reader.done:
 			return false
 		default:
 		}
@@ -59,7 +63,14 @@ func OpenAIWSIngressCanFailover(ctx context.Context, c *gin.Context) bool {
 
 func openAIWSGetIngressReader(c *gin.Context, conn *coderws.Conn) *openAIWSIngressReader {
 	if value, ok := c.Get(openAIWSIngressReaderKey); ok {
-		return value.(*openAIWSIngressReader)
+		if reader, valid := value.(*openAIWSIngressReader); valid && reader != nil {
+			return reader
+		}
+		// Do not start a second connection reader when cached state is invalid.
+		reader := &openAIWSIngressReader{conn: conn, done: make(chan struct{}), err: NewOpenAIWSClientCloseError(coderws.StatusInternalError, "invalid websocket ingress reader state", nil)}
+		close(reader.done)
+		c.Set(openAIWSIngressReaderKey, reader)
+		return reader
 	}
 	r := &openAIWSIngressReader{conn: conn, frames: make(chan openAIWSClientRead, 8), done: make(chan struct{})}
 	c.Set(openAIWSIngressReaderKey, r)

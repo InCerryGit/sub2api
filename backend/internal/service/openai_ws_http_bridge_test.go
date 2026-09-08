@@ -46,7 +46,7 @@ func TestProxyOpenAIWSHTTPBridgeSilentDisconnectBoundsDrain(t *testing.T) {
 	for _, usageArrives := range []bool{false, true} {
 		t.Run(fmt.Sprint("usage=", usageArrives), func(t *testing.T) {
 			body, writer := io.Pipe()
-			defer writer.Close()
+			defer func() { _ = writer.Close() }()
 			upstream := &contextAwareBridgeUpstream{httpUpstreamRecorder: httpUpstreamRecorder{resp: &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body}}, writer: writer}
 			svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())

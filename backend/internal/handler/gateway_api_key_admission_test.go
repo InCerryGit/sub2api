@@ -12,26 +12,21 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
-	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/service"
-	"github.com/alicebob/miniredis/v2"
+	"github.com/Wei-Shaw/sub2api/internal/testutil"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
 
-func newAPIKeyAdmissionHelper(t *testing.T) (*ConcurrencyHelper, service.ConcurrencyCache, *redis.Client) {
+func newAPIKeyAdmissionHelper(t *testing.T) (*ConcurrencyHelper, service.ConcurrencyCache) {
 	t.Helper()
-	server := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	t.Cleanup(func() { _ = rdb.Close() })
-	cache := repository.NewConcurrencyCache(rdb, 1, 60)
-	return NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Millisecond), cache, rdb
+	cache := testutil.NewRedisConcurrencyCache(t)
+	return NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Millisecond), cache
 }
 
 func TestAPIKeyAdmissionHTTPRejectsAndReleasesUser(t *testing.T) {
-	helper, cache, _ := newAPIKeyAdmissionHelper(t)
+	helper, cache := newAPIKeyAdmissionHelper(t)
 	ctx, cancelOwner := service.WithAPIKeyAdmissionOwner(context.Background())
 	defer cancelOwner()
 	hold, acquired, err := helper.TryAcquireUserSlotForAPIKey(ctx, 1, 3, 77, 1)
@@ -87,7 +82,7 @@ func (*unavailableKeyAdmissionCache) GetAPIKeyConcurrencyBatch(context.Context, 
 }
 
 func TestAPIKeyAdmissionRedisFailureDoesNotAdmit(t *testing.T) {
-	_, cache, _ := newAPIKeyAdmissionHelper(t)
+	_, cache := newAPIKeyAdmissionHelper(t)
 	helper := NewConcurrencyHelper(service.NewConcurrencyService(&unavailableKeyAdmissionCache{cache}), SSEPingFormatNone, time.Millisecond)
 	c, _ := newHelperTestContext(http.MethodPost, "/v1/responses")
 	started := false
@@ -101,7 +96,7 @@ func TestAPIKeyAdmissionRedisFailureDoesNotAdmit(t *testing.T) {
 }
 
 func TestWSAPIKeyAdmissionSecondTurnRejectsWithoutUpstreamRetry(t *testing.T) {
-	helper, cache, _ := newAPIKeyAdmissionHelper(t)
+	helper, cache := newAPIKeyAdmissionHelper(t)
 	var upstreamCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls.Add(1)
@@ -114,7 +109,7 @@ func TestWSAPIKeyAdmissionSecondTurnRejectsWithoutUpstreamRetry(t *testing.T) {
 	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
 	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
 	cfg.Gateway.OpenAIWS.WriteTimeoutSeconds = 1
-	svc := service.NewOpenAIGatewayService(nil, nil, nil, nil, nil, nil, nil, cfg, nil, nil, nil, nil, nil, repository.NewHTTPUpstream(cfg), nil, nil, nil, nil, nil, nil, nil, nil)
+	svc := service.NewOpenAIGatewayService(nil, nil, nil, nil, nil, nil, nil, cfg, nil, nil, nil, nil, nil, testutil.NewRealHTTPUpstream(cfg), nil, nil, nil, nil, nil, nil, nil, nil)
 	account := &service.Account{ID: 1, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Concurrency: 3,
 		Credentials: map[string]any{"base_url": upstream.URL, "api_key": "sk-test"},
 		Extra:       map[string]any{"openai_apikey_responses_websockets_v2_mode": service.OpenAIWSIngressModeHTTPBridge}}
@@ -126,7 +121,7 @@ func TestWSAPIKeyAdmissionSecondTurnRejectsWithoutUpstreamRetry(t *testing.T) {
 			done <- err
 			return
 		}
-		defer conn.CloseNow()
+		defer func() { _ = conn.CloseNow() }()
 		ctx, cancelOwner := service.WithAPIKeyAdmissionOwner(r.Context())
 		defer cancelOwner()
 		release, acquired, err := helper.TryAcquireWSUserSlotForAPIKey(ctx, 202, 3, 77, 1)
@@ -175,7 +170,7 @@ func TestWSAPIKeyAdmissionSecondTurnRejectsWithoutUpstreamRetry(t *testing.T) {
 	defer gateway.Close()
 	client, _, err := coderws.Dial(context.Background(), "ws"+strings.TrimPrefix(gateway.URL, "http"), nil)
 	require.NoError(t, err)
-	defer client.CloseNow()
+	defer func() { _ = client.CloseNow() }()
 	readCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, _, err = client.Read(readCtx)

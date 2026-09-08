@@ -86,15 +86,19 @@ func TestAPIKeyAdmissionAtomicCompetition(t *testing.T) {
 func testAPIKeyLiveAdmission(t *testing.T, clients []*redis.Client) {
 	t.Helper()
 	ctx := context.Background()
-	cache := NewConcurrencyCache(clients[0], 1, 60).(*concurrencyCache)
-	other := NewConcurrencyCache(clients[1], 1, 60).(*concurrencyCache)
+	cache, cacheOK := NewConcurrencyCache(clients[0], 1, 60).(*concurrencyCache)
+	require.True(t, cacheOK)
+	other, otherOK := NewConcurrencyCache(clients[1], 1, 60).(*concurrencyCache)
+	require.True(t, otherOK)
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	for i, client := range []*concurrencyCache{cache, other} {
 		go func(i int, client *concurrencyCache) {
 			<-start
 			ok, err := client.AcquireLiveLease(ctx, int64(910+i), 0, int64(920+i), 0, 904, 2, []string{"pending-sdp-a", "pending-sdp-b"}[i], true)
-			if err == nil && !ok { err = service.ErrAPIKeyConcurrencyLimit }
+			if err == nil && !ok {
+				err = service.ErrAPIKeyConcurrencyLimit
+			}
 			results <- err
 		}(i, client)
 	}
@@ -125,7 +129,8 @@ func TestAPIKeyAdmissionPruningAndSameRequest(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	cache := NewConcurrencyCache(rdb, 1, 60).(*concurrencyCache)
+	cache, cacheOK := NewConcurrencyCache(rdb, 1, 60).(*concurrencyCache)
+	require.True(t, cacheOK)
 	ctx := context.Background()
 	for i := 0; i < 2; i++ {
 		ok, err := cache.AcquireAPIKeySlot(ctx, 903, 1, "same-request")
@@ -158,7 +163,8 @@ func TestAPIKeyAdmissionLiveSessionsShareLimit(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	cache := NewConcurrencyCache(rdb, 1, 60).(*concurrencyCache)
+	cache, cacheOK := NewConcurrencyCache(rdb, 1, 60).(*concurrencyCache)
+	require.True(t, cacheOK)
 	ctx := context.Background()
 	ok, err := cache.AcquireLiveLease(ctx, 10, 5, 20, 5, 30, 1, "live", false)
 	require.NoError(t, err)
