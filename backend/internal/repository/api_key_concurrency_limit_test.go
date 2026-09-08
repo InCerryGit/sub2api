@@ -27,7 +27,7 @@ func TestAPIKeyConcurrencyLimitRepository(t *testing.T) {
 	for _, limit := range []int{7, 11, 0} {
 		key.ConcurrencyLimit = limit
 		if limit != 7 {
-			require.NoError(t, repo.Update(ctx, key))
+			require.NoError(t, repo.Update(ctx, key, service.APIKeyUpdateFields{ConcurrencyLimit: true}))
 		}
 		for _, get := range []func() (*service.APIKey, error){
 			func() (*service.APIKey, error) { return repo.GetByID(ctx, key.ID) },
@@ -50,8 +50,22 @@ func TestAPIKeyConcurrencyLimitRepository(t *testing.T) {
 			require.Equal(t, limit, keys[0].ConcurrencyLimit)
 		}
 	}
+	// A stale edit must not overwrite columns owned by another update or billing.
+	require.NoError(t, client.APIKey.UpdateOneID(key.ID).SetConcurrencyLimit(8).SetQuotaUsed(23).Exec(ctx))
+	key.Name = "renamed"
+	require.NoError(t, repo.Update(ctx, key, service.APIKeyUpdateFields{Name: true}))
+	saved, err := repo.GetByID(ctx, key.ID)
+	require.NoError(t, err)
+	require.Equal(t, 8, saved.ConcurrencyLimit)
+	key.ConcurrencyLimit = 4
+	require.NoError(t, repo.Update(ctx, key, service.APIKeyUpdateFields{ConcurrencyLimit: true}))
+	saved, err = repo.GetByID(ctx, key.ID)
+	require.NoError(t, err)
+	require.Equal(t, 4, saved.ConcurrencyLimit)
+	require.Equal(t, 23.0, saved.QuotaUsed)
+	require.Equal(t, "renamed", saved.Name)
 	key.ConcurrencyLimit = -1
-	require.Error(t, repo.Update(ctx, key))
+	require.Error(t, repo.Update(ctx, key, service.APIKeyUpdateFields{ConcurrencyLimit: true}))
 	key.Key = "sk-negative-limit"
 	require.Error(t, repo.Create(ctx, key))
 }

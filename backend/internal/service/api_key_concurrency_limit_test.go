@@ -34,7 +34,7 @@ func (r *concurrencyLimitRepo) GetByKeyForAuth(context.Context, string) (*APIKey
 	key := r.key
 	return &key, nil
 }
-func (r *concurrencyLimitRepo) Update(_ context.Context, key *APIKey) error {
+func (r *concurrencyLimitRepo) Update(_ context.Context, key *APIKey, _ APIKeyUpdateFields) error {
 	r.key = *key
 	r.writes++
 	return nil
@@ -140,10 +140,10 @@ func TestAPIKeyConcurrencyLimitUpdateAndAuthCache(t *testing.T) {
 	_, err := svc.Update(ctx, 1, 2, UpdateAPIKeyRequest{ConcurrencyLimit: concurrencyLimitPtr(-1)})
 	require.Error(t, err)
 	require.Equal(t, writes, repo.writes)
-	// A v16 entry must reload the configured value instead of implying unlimited.
+	// An upstream v24 entry must reload the configured value instead of implying unlimited.
 	svc.authCacheL1.Clear()
 	repo.key.ConcurrencyLimit = 12
-	cache.data = []byte(`{"snapshot":{"version":16,"api_key_id":1}}`)
+	cache.data = []byte(`{"snapshot":{"version":24,"api_key_id":1}}`)
 	key, err := svc.GetByKey(ctx, repo.key.Key)
 	require.NoError(t, err)
 	require.Equal(t, 12, key.ConcurrencyLimit)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,7 +179,7 @@ func TestListOllamaCloudUsageGroupAccountsUsesOneStrictBatchQuery(t *testing.T) 
 	require.Empty(t, accounts)
 	query := normalizeSQLWhitespace(capturedSQL)
 	require.Contains(t, query, "credentials ->> 'api_key' = ANY($1)")
-	require.Contains(t, query, "platform IN ('openai', 'anthropic')")
+	require.Contains(t, query, "platform IN ('openai', 'anthropic', 'kimi', 'zhipu', 'deepseek')")
 	require.Contains(t, query, "jsonb_typeof(credentials -> 'api_key') = 'string'")
 	require.Contains(t, query, ollamaCloudBaseURLMatchesSQL("credentials ->> 'base_url'"))
 	require.NotContains(t, query, "~*")
@@ -190,13 +191,15 @@ func TestListDueOllamaCloudUsageAccountsFiltersOrdersAndLimits(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	now := time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC)
+	debounce := time.Minute
+	maxWait := time.Hour
 	var capturedSQL string
-	mock.ExpectQuery("WITH candidates AS").
-		WithArgs(now, 20).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectQuery("WITH eligible AS").
+		WithArgs(now.UTC(), debounce.Seconds(), maxWait.Seconds(), 20, service.OllamaCloudUsageMinFetchInterval.Seconds()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "group_last_used_at"}))
 	repo := newAccountRepositoryWithSQL(nil, captureQuerySQL{db: db, captured: &capturedSQL}, nil)
 
-	accounts, err := repo.ListDueOllamaCloudUsageAccounts(context.Background(), now, 20)
+	accounts, err := repo.ListDueOllamaCloudUsageAccounts(context.Background(), now, debounce, maxWait, 20)
 
 	require.NoError(t, err)
 	require.Empty(t, accounts)
@@ -204,15 +207,29 @@ func TestListDueOllamaCloudUsageAccountsFiltersOrdersAndLimits(t *testing.T) {
 	for _, clause := range []string{
 		"deleted_at IS NULL",
 		"status = 'active'",
-		"platform IN ('openai', 'anthropic')",
+		"platform IN ('openai', 'anthropic', 'kimi', 'zhipu', 'deepseek')",
 		"type = 'apikey'",
 		ollamaCloudBaseURLMatchesSQL("credentials ->> 'base_url'"),
 		"jsonb_typeof(extra -> 'ollama_cloud_usage_session') = 'string'",
 		`extra @> '{"ollama_cloud_usage_auto_refresh": true}'::jsonb`,
-		"parsed_next_refresh_at::timestamptz <= $1",
+		"MAX(last_used_at) AS group_last_used_at",
 		"PARTITION BY api_key",
 		"WHERE group_rank = 1",
-		"LIMIT $2",
+		"LIMIT $4",
+		"make_interval(secs => $2::double precision)",
+		"make_interval(secs => $3::double precision)",
+		// Minimum interval floor between successful fetches.
+		"make_interval(secs => $5::double precision)",
+		// jsonpath .datetime() only accepts the ISO-8601 "Z" designator from
+		// PostgreSQL 17 on, and this service writes UTC timestamps. Without this
+		// rewrite every parsed_* column is NULL on 14-16 and the due filter
+		// collapses into its fail-open branch.
+		`regexp_replace( regexp_replace( fetched_at, '(\.[0-9]{6})[0-9]+(Z|[+-][0-9]{2}:[0-9]{2})$', '\1\2' ), 'Z$', '+00:00' )`,
+		"group_last_used_at > parsed_fetched_at::timestamptz",
+		"group_last_used_at > parsed_last_attempt_at::timestamptz",
+		"$1 >= activity_due_at",
+		"COALESCE(parsed_next_refresh_at::timestamptz, '-infinity'::timestamptz)",
+		"ORDER BY due_class, due_at NULLS FIRST, id",
 	} {
 		require.Contains(t, normalized, clause)
 	}
@@ -234,7 +251,7 @@ func TestBulkUpdateOllamaIdentityCleanupIsValueConditional(t *testing.T) {
 	require.Contains(t, query, "NOT ("+ollamaCloudBaseURLMatchesSQL("credentials ->> 'base_url'"))
 	require.Contains(t, query, ollamaCloudBaseURLMatchesSQL("$1::jsonb ->> 'base_url'"))
 	require.NotContains(t, query, "~*")
-	require.Contains(t, query, "platform IN ('openai', 'anthropic') AND type = 'apikey'")
+	require.Contains(t, query, "platform IN ('openai', 'anthropic', 'kimi', 'zhipu', 'deepseek') AND type = 'apikey'")
 	require.Contains(t, query, "- 'ollama_cloud_usage_session' - 'ollama_cloud_usage_auto_refresh' - 'ollama_cloud_usage_snapshot'")
 	payload, ok := exec.execArgs[0][0].([]byte)
 	require.True(t, ok)
@@ -297,5 +314,69 @@ func TestUpdateCredentialsCleanupBranchRequiresChangedCredentials(t *testing.T) 
 	})
 
 	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// SQL 平台白名单常量与 service 判定必须互为镜像：对每个已知平台，常量里的
+// 成员关系都要与 IsOllamaCloudUsageAccount（apikey + 官方 ollama.com）一致，
+// 防止两侧平台列表各自漂移。
+func TestOllamaCloudUsagePlatformWhitelistMatchesServicePredicate(t *testing.T) {
+	matches := regexp.MustCompile(`'([^']+)'`).FindAllStringSubmatch(ollamaCloudUsagePlatformsSQL, -1)
+	sqlPlatforms := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		sqlPlatforms[match[1]] = struct{}{}
+	}
+	require.Len(t, sqlPlatforms, 5)
+	for _, platform := range []string{
+		service.PlatformOpenAI, service.PlatformAnthropic,
+		service.PlatformKimi, service.PlatformZhipu, service.PlatformDeepseek,
+		service.PlatformGemini, service.PlatformGrok, service.PlatformAntigravity,
+		service.PlatformComposite, "kiro",
+	} {
+		account := ollamaCloudUsageRepositoryAccount()
+		account.Platform = platform
+		_, inSQL := sqlPlatforms[platform]
+		require.Equal(t, inSQL, service.IsOllamaCloudUsageAccount(account), platform)
+	}
+}
+
+// 语义等价性：平台放开后，普通（非 ollama）kimi apikey 账号改凭证会从通用
+// apikey 分支落到 Ollama 分支——多减三个它本来就不存在的 ollama 键。分支必须
+// 仍然清掉 probe 快照，且不得减其它任何 extra 键。
+func TestUpdateCredentialsPlainCNAPIKeyAccountCleanupStaysSemanticallyEquivalent(t *testing.T) {
+	var capturedSQL string
+	matcher := sqlmock.QueryMatcherFunc(func(expectedSQL, actualSQL string) error {
+		if strings.Contains(actualSQL, "UPDATE accounts") {
+			capturedSQL = actualSQL
+		}
+		return sqlmock.QueryMatcherRegexp.Match(expectedSQL, actualSQL)
+	})
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(matcher))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	client := dbent.NewClient(dbent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	t.Cleanup(func() { _ = client.Close() })
+	mock.ExpectBegin()
+	mock.ExpectExec(`(?s)UPDATE accounts.*- 'upstream_billing_probe'.*- 'ollama_cloud_usage_session'.*- 'ollama_cloud_usage_auto_refresh'.*- 'ollama_cloud_usage_snapshot'`).
+		WithArgs(`{"api_key":"rotated-key","base_url":"https://api.moonshot.cn/v1"}`, int64(17)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO scheduler_outbox")).
+		WithArgs(service.SchedulerOutboxEventAccountChanged, int64(17), nil, nil, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+	repo := newAccountRepositoryWithSQL(client, db, nil)
+
+	err = repo.UpdateCredentials(context.Background(), 17, map[string]any{
+		"api_key": "rotated-key", "base_url": "https://api.moonshot.cn/v1",
+	})
+
+	require.NoError(t, err)
+	query := normalizeSQLWhitespace(capturedSQL)
+	require.Contains(t, query,
+		"platform IN ('openai', 'anthropic', 'kimi', 'zhipu', 'deepseek') AND type = 'apikey' AND credentials IS DISTINCT FROM $1::jsonb")
+	require.Contains(t, query,
+		"THEN COALESCE(extra, '{}'::jsonb) - 'upstream_billing_probe' - 'ollama_cloud_usage_session' - 'ollama_cloud_usage_auto_refresh' - 'ollama_cloud_usage_snapshot'")
+	require.NotContains(t, query, "- 'upstream_billing_probe_enabled'")
+	require.NotContains(t, query, "- 'upstream_billing_rate_sync_enabled'")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
