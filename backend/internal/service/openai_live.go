@@ -177,25 +177,57 @@ func (s *OpenAIGatewayService) CreateLiveCall(
 
 		account := selection.Account
 		leaseID := generateRequestID()
+		acquireCtx, cancelAcquire := context.WithTimeout(ctx, liveRedisOperationTimeout)
 		acquired, acquireErr := liveCache.AcquireLiveLease(
-			ctx,
+			acquireCtx,
 			account.ID,
 			account.Concurrency,
 			identity.UserID,
 			userMaxConcurrency,
 			identity.APIKeyID,
+			identity.APIKeyConcurrencyLimit,
 			leaseID,
 			true,
 		)
+		cancelAcquire()
 		if acquireErr != nil || !acquired {
 			selection.ReleaseFunc()
 			if acquireErr != nil {
-				return nil, acquireErr
+				s.releaseLiveLease(account.ID, identity.UserID, identity.APIKeyID, leaseID)
+				if errors.Is(acquireErr, ErrAPIKeyConcurrencyLimit) {
+					return nil, acquireErr
+				}
+				return nil, fmt.Errorf("%w: acquire Live lease: %w", ErrLiveUnavailable, acquireErr)
 			}
 			return nil, ErrLiveConcurrencyFull
 		}
 
-		created, createErr := s.createUpstreamLiveCall(ctx, account, request, attestation)
+		// SDP establishment already owns the Live member. Renew it before the
+		// observer/sideband controller exists, and stop the POST on lease loss.
+		pendingCtx, cancelPending := context.WithCancelCause(ctx)
+		pendingDone := make(chan struct{})
+		go func() {
+			defer close(pendingDone)
+			ticker := time.NewTicker(liveLeaseRefreshInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-pendingCtx.Done():
+					return
+				case <-ticker.C:
+					if !s.refreshLiveLease(&LiveCallRecord{AccountID: account.ID, UserID: identity.UserID, APIKeyID: identity.APIKeyID, LeaseID: leaseID}) {
+						cancelPending(ErrAPIKeySlotLeaseLost)
+						return
+					}
+				}
+			}
+		}()
+		created, createErr := s.createUpstreamLiveCall(pendingCtx, account, request, attestation)
+		if errors.Is(context.Cause(pendingCtx), ErrAPIKeySlotLeaseLost) {
+			createErr = ErrAPIKeySlotLeaseLost
+		}
+		cancelPending(context.Canceled)
+		<-pendingDone
 		selection.ReleaseFunc()
 		if createErr != nil {
 			s.releaseLiveLease(account.ID, identity.UserID, identity.APIKeyID, leaseID)

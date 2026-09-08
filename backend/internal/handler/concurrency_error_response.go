@@ -5,9 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+
+	"github.com/Wei-Shaw/sub2api/internal/service"
+	coderws "github.com/coder/websocket"
 )
 
 const statusClientClosedRequest = 499
+
+func openAIWSUserSlotAcquireError(err error) *service.OpenAIWSClientCloseError {
+	var limitErr *ConcurrencyError
+	if errors.As(err, &limitErr) && limitErr.SlotType == "API key" {
+		return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "API key concurrency limit reached; please retry later", err).(*service.OpenAIWSClientCloseError)
+	}
+	return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "failed to acquire concurrency slot", err).(*service.OpenAIWSClientCloseError)
+}
 
 const (
 	gatewayQueueFullCode        = "gateway_queue_full"

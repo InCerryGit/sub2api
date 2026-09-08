@@ -126,7 +126,7 @@ func TestWSHTTPBridgeCompressedCancellationClosesBeforeSlotRelease(t *testing.T)
 						return
 					}
 					defer conn.CloseNow()
-					release, acquired, err := helper.TryAcquireWSUserSlotForAPIKey(ctx, 202, 3, 77)
+					release, acquired, err := helper.TryAcquireWSUserSlotForAPIKey(ctx, 202, 3, 77, 0)
 					if err != nil || !acquired {
 						done <- err
 						return

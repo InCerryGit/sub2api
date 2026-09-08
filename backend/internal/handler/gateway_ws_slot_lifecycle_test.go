@@ -15,7 +15,7 @@ func TestWSAPIKeySlotCancellationWaitsForExplicitTurnCleanup(t *testing.T) {
 		cache := &helperConcurrencyCacheStub{userSeq: []bool{true}}
 		helper := NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second)
 		ctx, cancel := context.WithCancel(context.Background())
-		release, acquired, err := helper.TryAcquireWSUserSlotForAPIKey(ctx, 202, 3, 77)
+		release, acquired, err := helper.TryAcquireWSUserSlotForAPIKey(ctx, 202, 3, 77, 0)
 		require.NoError(t, err)
 		require.True(t, acquired)
 		defer release()
@@ -58,7 +58,7 @@ func TestWSUserSlotAcquisitionRemainsCancellable(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			release, acquired, err := helper.TryAcquireWSUserSlotForAPIKey(ctx, 202, 3, 77)
+			release, acquired, err := helper.TryAcquireWSUserSlotForAPIKey(ctx, 202, 3, 77, 0)
 			require.ErrorIs(t, err, context.Canceled)
 			require.False(t, acquired)
 			require.Nil(t, release)
@@ -75,7 +75,7 @@ func TestHTTPAPIKeySlotStillReleasesOnCancellation(t *testing.T) {
 		cache := &helperConcurrencyCacheStub{userSeq: []bool{true}}
 		helper := NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second)
 		ctx, cancel := context.WithCancel(context.Background())
-		release, acquired, err := helper.TryAcquireUserSlotForAPIKey(ctx, 202, 3, 77)
+		release, acquired, err := helper.TryAcquireUserSlotForAPIKey(ctx, 202, 3, 77, 0)
 		require.NoError(t, err)
 		require.True(t, acquired)
 		cancel()

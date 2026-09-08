@@ -136,16 +136,19 @@ var (
 		local userRegular = KEYS[3]
 		local userLive = KEYS[4]
 		local apiLive = KEYS[5]
+		local apiRegular = KEYS[6]
 		local accountMax = tonumber(ARGV[1])
 		local userMax = tonumber(ARGV[2])
 		local ttl = tonumber(ARGV[3])
 		local leaseID = ARGV[4]
 		local replacing = tonumber(ARGV[5])
+		local apiMax = tonumber(ARGV[6])
 		local now = tonumber(redis.call('TIME')[1])
 		local liveExpireBefore = now - ttl
 		redis.call('ZREMRANGEBYSCORE', accountLive, '-inf', liveExpireBefore)
 		redis.call('ZREMRANGEBYSCORE', userLive, '-inf', liveExpireBefore)
 		redis.call('ZREMRANGEBYSCORE', apiLive, '-inf', liveExpireBefore)
+		redis.call('ZREMRANGEBYSCORE', apiRegular, '-inf', now - tonumber(ARGV[7]))
 		if redis.call('ZSCORE', accountLive, leaseID) ~= false then
 			return 1
 		end
@@ -155,6 +158,8 @@ var (
 		if replacing == 1 then allowance = 1 end
 		if accountMax > 0 and accountCount >= accountMax + allowance then return 0 end
 		if userMax > 0 and userCount >= userMax + allowance then return 0 end
+		local apiCount = redis.call('ZCARD', apiRegular) + redis.call('ZCARD', apiLive)
+		if apiMax > 0 and apiCount >= apiMax then return 2 end
 		redis.call('ZADD', accountLive, now, leaseID)
 		redis.call('ZADD', userLive, now, leaseID)
 		redis.call('ZADD', apiLive, now, leaseID)
@@ -740,6 +745,30 @@ func (c *concurrencyCache) GetUserConcurrency(ctx context.Context, userID int64)
 	return result, nil
 }
 
+// Admission and statistics share the same members. Redis TIME keeps pruning
+// consistent across gateway instances; retrying the same member is idempotent.
+var acquireAPIKeySlotScript = redis.NewScript(`
+	redis.replicate_commands()
+	local now = tonumber(redis.call('TIME')[1])
+	local ttl = tonumber(ARGV[1])
+	local member = ARGV[2]
+	local limit = tonumber(ARGV[3])
+	redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - ttl)
+	redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now - tonumber(ARGV[4]))
+	local count = redis.call('ZCARD', KEYS[1]) + redis.call('ZCARD', KEYS[2])
+	if redis.call('ZSCORE', KEYS[1], member) == false and limit > 0 and count >= limit then
+		return 0
+	end
+	redis.call('ZADD', KEYS[1], now, member)
+	redis.call('EXPIRE', KEYS[1], ttl)
+	return 1
+`)
+
+func (c *concurrencyCache) AcquireAPIKeySlot(ctx context.Context, apiKeyID int64, maxConcurrency int, requestID string) (bool, error) {
+	n, err := acquireAPIKeySlotScript.Run(ctx, c.rdb, []string{apiKeySlotKey(apiKeyID), liveAPIKeySlotKey(apiKeyID)}, c.slotTTLSeconds, requestID, maxConcurrency, liveLeaseTTLSeconds).Int()
+	return n == 1, err
+}
+
 func (c *concurrencyCache) TrackAPIKeySlot(ctx context.Context, apiKeyID int64, requestID string) error {
 	key := apiKeySlotKey(apiKeyID)
 	_, err := trackSlotScript.Run(ctx, c.rdb, []string{key}, c.slotTTLSeconds, requestID).Result()
@@ -753,6 +782,10 @@ func (c *concurrencyCache) ReleaseAPIKeySlot(ctx context.Context, apiKeyID int64
 
 func (c *concurrencyCache) APIKeySlotRefreshInterval() time.Duration {
 	return time.Duration(c.slotTTLSeconds) * time.Second / 3
+}
+
+func (c *concurrencyCache) APIKeySlotTTL() time.Duration {
+	return time.Duration(c.slotTTLSeconds) * time.Second
 }
 
 // Refresh only an existing member, atomically with its key TTL. In particular,
@@ -822,6 +855,7 @@ func (c *concurrencyCache) AcquireLiveLease(
 	userID int64,
 	userMax int,
 	apiKeyID int64,
+	apiKeyMax int,
 	leaseID string,
 	replacingRegularSlots bool,
 ) (bool, error) {
@@ -838,7 +872,11 @@ func (c *concurrencyCache) AcquireLiveLease(
 		userSlotKey(userID),
 		liveUserSlotKey(userID),
 		liveAPIKeySlotKey(apiKeyID),
-	}, accountMax, userMax, liveLeaseTTLSeconds, leaseID, replacing).Int()
+		apiKeySlotKey(apiKeyID),
+	}, accountMax, userMax, liveLeaseTTLSeconds, leaseID, replacing, apiKeyMax, c.slotTTLSeconds).Int()
+	if err == nil && result == 2 {
+		return false, service.ErrAPIKeyConcurrencyLimit
+	}
 	return result == 1, err
 }
 

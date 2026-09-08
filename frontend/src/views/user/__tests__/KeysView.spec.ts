@@ -7,6 +7,8 @@ import KeysView from '../KeysView.vue'
 
 const {
   listKeys,
+  createKey,
+  updateKey,
   getPublicSettings,
   getDashboardApiKeysUsage,
   getAvailableGroups,
@@ -18,6 +20,8 @@ const {
   nextStep,
 } = vi.hoisted(() => ({
   listKeys: vi.fn(),
+  createKey: vi.fn(),
+  updateKey: vi.fn(),
   getPublicSettings: vi.fn(),
   getDashboardApiKeysUsage: vi.fn(),
   getAvailableGroups: vi.fn(),
@@ -44,6 +48,8 @@ const messages: Record<string, string> = {
   'keys.group': 'Group',
   'keys.id': 'ID',
   'keys.currentConcurrency': 'Current Concurrency',
+  'keys.noAdditionalConcurrencyLimit': 'No additional limit',
+  'keys.concurrencyLimitInvalid': 'Enter a nonnegative whole number for the concurrency limit.',
   'keys.lastUsedAt': 'Last Used',
   'keys.lastUsedIP': 'Last Used IP',
   'keys.rateLimitColumn': 'Rate Limit',
@@ -58,8 +64,8 @@ const messages: Record<string, string> = {
 vi.mock('@/api', () => ({
   keysAPI: {
     list: listKeys,
-    create: vi.fn(),
-    update: vi.fn(),
+    create: createKey,
+    update: updateKey,
     delete: vi.fn(),
     toggleStatus: vi.fn(),
   },
@@ -122,6 +128,7 @@ const createApiKey = (): ApiKey => ({
   created_at: '2026-06-27T00:00:00Z',
   updated_at: '2026-06-27T00:00:00Z',
   current_concurrency: 3,
+  concurrency_limit: 0,
   rate_limit_5h: 0,
   rate_limit_1d: 0,
   rate_limit_7d: 0,
@@ -170,6 +177,7 @@ const DataTableStub = {
           <slot name="cell-id" :value="row.id" :row="row" />
         </div>
         <slot name="cell-name" :value="row.name" :row="row" />
+        <slot name="cell-actions" :row="row" />
         <div data-test="current-concurrency">
           <slot name="cell-current_concurrency" :value="row.current_concurrency" :row="row" />
         </div>
@@ -223,7 +231,10 @@ const mountView = async () => {
         TablePageLayout: TablePageLayoutStub,
         DataTable: DataTableStub,
         Pagination: PaginationStub,
-        BaseDialog: true,
+        BaseDialog: {
+          props: ['show'],
+          template: '<div v-if="show"><slot /><slot name="footer" /></div>',
+        },
         ConfirmDialog: true,
         EmptyState: true,
         Select: SelectStub,
@@ -261,6 +272,8 @@ describe('user KeysView column settings', () => {
     localStorage.clear()
 
     listKeys.mockReset()
+    createKey.mockReset().mockResolvedValue(createApiKey())
+    updateKey.mockReset().mockResolvedValue(createApiKey())
     getPublicSettings.mockReset()
     getDashboardApiKeysUsage.mockReset()
     getAvailableGroups.mockReset()
@@ -391,7 +404,68 @@ describe('user KeysView column settings', () => {
   it('renders the current concurrency value', async () => {
     const wrapper = await mountView()
 
-    expect(wrapper.get('[data-test="current-concurrency"]').text()).toBe('3')
+    expect(wrapper.get('[data-test="current-concurrency"]').text()).toBe('3 No additional limit')
+  })
+
+  it('shows current / max for a key with an additional concurrency limit', async () => {
+    listKeys.mockResolvedValueOnce({ items: [{ ...createApiKey(), concurrency_limit: 8 }], total: 1 })
+    const wrapper = await mountView()
+    expect(wrapper.get('[data-test="current-concurrency"]').text()).toBe('3 / 8')
+  })
+
+  it.each([8, 0, ''])('creates a key with concurrency input %s and resets the form', async (input) => {
+    const wrapper = await mountView()
+    await getButtonByText(wrapper, 'Create API Key').trigger('click')
+    expect((wrapper.get('#key-concurrency-limit').element as HTMLInputElement).value).toBe('0')
+    await wrapper.get('[data-tour="key-form-name"]').setValue('new-key')
+    await wrapper.getComponent('[data-tour="key-form-group"]').vm.$emit('update:modelValue', 42)
+    await wrapper.get('#key-concurrency-limit').setValue(input)
+    await wrapper.get('#key-form').trigger('submit')
+    await flushPromises()
+    expect(createKey).toHaveBeenCalledWith('new-key', 42, undefined, [], [], 0, undefined,
+      { rate_limit_5h: 0, rate_limit_1d: 0, rate_limit_7d: 0 }, Number(input))
+    await getButtonByText(wrapper, 'Create API Key').trigger('click')
+    expect((wrapper.get('#key-concurrency-limit').element as HTMLInputElement).value).toBe('0')
+  })
+
+  it.each([12, 0, ''])('loads the saved limit and updates concurrency input %s', async (input) => {
+    listKeys.mockResolvedValueOnce({ items: [{ ...createApiKey(), group_id: 42, concurrency_limit: 8 }], total: 1 })
+    const wrapper = await mountView()
+    await getButtonByText(wrapper, 'common.edit').trigger('click')
+    expect((wrapper.get('#key-concurrency-limit').element as HTMLInputElement).value).toBe('8')
+    await wrapper.get('#key-concurrency-limit').setValue(input)
+    await wrapper.get('#key-form').trigger('submit')
+    await flushPromises()
+    expect(updateKey).toHaveBeenCalledWith(1, expect.objectContaining({ concurrency_limit: Number(input) }))
+  })
+
+  it.each([
+    ['create', -1], ['create', 1.5], ['edit', -1], ['edit', 1.5],
+  ])('rejects invalid concurrency in %s mode: %s', async (mode, input) => {
+    listKeys.mockResolvedValueOnce({ items: [{ ...createApiKey(), group_id: 42 }], total: 1 })
+    const wrapper = await mountView()
+    await getButtonByText(wrapper, mode === 'edit' ? 'common.edit' : 'Create API Key').trigger('click')
+    await wrapper.getComponent('[data-tour="key-form-group"]').vm.$emit('update:modelValue', 42)
+    await wrapper.get('#key-concurrency-limit').setValue(input)
+    expect(wrapper.get('#key-concurrency-limit').attributes('aria-invalid')).toBe('true')
+    expect(wrapper.get('#key-concurrency-error').text()).toBe(messages['keys.concurrencyLimitInvalid'])
+    await wrapper.get('#key-form').trigger('submit')
+    expect(showError).toHaveBeenCalledWith(messages['keys.concurrencyLimitInvalid'])
+    expect(createKey).not.toHaveBeenCalled()
+    expect(updateKey).not.toHaveBeenCalled()
+  })
+
+  it('keeps the edit form and entered limit when the server rejects an update', async () => {
+    listKeys.mockResolvedValueOnce({ items: [{ ...createApiKey(), group_id: 42, concurrency_limit: 8 }], total: 1 })
+    updateKey.mockRejectedValueOnce({ response: { data: { detail: 'Concurrency limit rejected' } } })
+    const wrapper = await mountView()
+    await getButtonByText(wrapper, 'common.edit').trigger('click')
+    await wrapper.get('#key-concurrency-limit').setValue(12)
+    await wrapper.get('#key-form').trigger('submit')
+    await flushPromises()
+    expect(showError).toHaveBeenCalledWith('Concurrency limit rejected')
+    expect(showSuccess).not.toHaveBeenCalled()
+    expect((wrapper.get('#key-concurrency-limit').element as HTMLInputElement).value).toBe('12')
   })
 
   it('marks current concurrency as sortable', async () => {

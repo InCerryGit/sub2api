@@ -97,13 +97,15 @@ func (h *OpenAIGatewayHandler) Live(c *gin.Context) {
 		return
 	}
 
+	// The Live service atomically owns key capacity before opening upstream.
+	// Reserving a regular key member here would double-count the SDP handoff.
 	userRelease, acquired, err := h.concurrencyHelper.TryAcquireUserSlot(
 		c.Request.Context(),
 		subject.UserID,
 		subject.Concurrency,
 	)
 	if err != nil {
-		h.errorResponse(c, http.StatusServiceUnavailable, "api_error", "Live concurrency unavailable")
+		h.handleConcurrencyError(c, err, "user", false)
 		return
 	}
 	if !acquired {
@@ -167,21 +169,24 @@ func liveCallIdentity(
 		subscriptionID = &value
 	}
 	return service.LiveCallIdentity{
-		APIKeyID:        apiKey.ID,
-		UserID:          userID,
-		GroupID:         apiKey.GroupID,
-		SubscriptionID:  subscriptionID,
-		UserAgent:       c.GetHeader("User-Agent"),
-		IPAddress:       ip.GetClientIP(c),
-		InboundEndpoint: GetInboundEndpoint(c),
+		APIKeyConcurrencyLimit: apiKey.ConcurrencyLimit,
+		APIKeyID:               apiKey.ID,
+		UserID:                 userID,
+		GroupID:                apiKey.GroupID,
+		SubscriptionID:         subscriptionID,
+		UserAgent:              c.GetHeader("User-Agent"),
+		IPAddress:              ip.GetClientIP(c),
+		InboundEndpoint:        GetInboundEndpoint(c),
 	}
 }
 
 func (h *OpenAIGatewayHandler) writeLiveCreateError(c *gin.Context, err error) {
 	switch {
+	case errors.Is(err, service.ErrAPIKeyConcurrencyLimit):
+		h.errorResponse(c, http.StatusTooManyRequests, "rate_limit_error", "API key concurrency limit reached; please retry later")
 	case errors.Is(err, service.ErrLiveConcurrencyFull):
 		h.errorResponse(c, http.StatusTooManyRequests, "rate_limit_error", "Live concurrency limit reached")
-	case errors.Is(err, service.ErrLiveUnavailable):
+	case errors.Is(err, service.ErrLiveUnavailable), errors.Is(err, service.ErrAPIKeySlotLeaseLost):
 		h.errorResponse(c, http.StatusServiceUnavailable, "api_error", "Live is unavailable")
 	default:
 		var attestationErr *service.LiveAttestationUnavailableError

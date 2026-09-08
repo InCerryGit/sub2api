@@ -174,7 +174,7 @@
             </div>
           </template>
 
-          <template #cell-current_concurrency="{ value }">
+          <template #cell-current_concurrency="{ value, row }">
             <span
               :class="[
                 'inline-flex min-w-8 items-center justify-center rounded px-2 py-1 text-sm font-semibold tabular-nums',
@@ -184,6 +184,10 @@
               ]"
             >
               {{ value ?? 0 }}
+              <span v-if="row.concurrency_limit > 0" class="ml-1">/ {{ row.concurrency_limit }}</span>
+            </span>
+            <span v-if="!row.concurrency_limit" class="mt-1 block text-xs text-gray-500 dark:text-dark-400">
+              {{ t('keys.noAdditionalConcurrencyLimit') }}
             </span>
           </template>
 
@@ -593,6 +597,26 @@
               <p class="input-hint">{{ t('keys.ipBlacklistHint') }}</p>
             </div>
           </div>
+        </div>
+
+        <div>
+          <label for="key-concurrency-limit" class="input-label">{{ t('keys.concurrencyLimit') }}</label>
+          <input
+            id="key-concurrency-limit"
+            v-model.number="formData.concurrency_limit"
+            type="number"
+            min="0"
+            step="1"
+            placeholder="0"
+            class="input"
+            :class="{ 'border-red-500 dark:border-red-500': concurrencyLimitError }"
+            :aria-invalid="!!concurrencyLimitError"
+            :aria-describedby="concurrencyLimitError ? 'key-concurrency-hint key-concurrency-error' : 'key-concurrency-hint'"
+          />
+          <p id="key-concurrency-hint" class="input-hint">{{ t('keys.concurrencyLimitHint') }}</p>
+          <p v-if="concurrencyLimitError" id="key-concurrency-error" class="mt-1 text-sm text-red-500" role="alert">
+            {{ concurrencyLimitError }}
+          </p>
         </div>
 
         <!-- Quota Limit Section -->
@@ -1329,6 +1353,7 @@ const setGroupButtonRef = (keyId: number, el: Element | ComponentPublicInstance 
 
 const formData = ref({
   name: '',
+  concurrency_limit: 0 as number | string,
   group_id: null as number | null,
   status: 'active' as 'active' | 'inactive',
   use_custom_key: false,
@@ -1347,6 +1372,11 @@ const formData = ref({
   enable_expiration: false,
   expiration_preset: '30' as '7' | '30' | '90' | 'custom',
   expiration_date: ''
+})
+
+const concurrencyLimitError = computed(() => {
+  const limit = Number(formData.value.concurrency_limit)
+  return Number.isSafeInteger(limit) && limit >= 0 ? '' : t('keys.concurrencyLimitInvalid')
 })
 
 // 自定义Key验证
@@ -1563,6 +1593,7 @@ const editKey = (key: ApiKey) => {
   const hasExpiration = !!key.expires_at
   formData.value = {
     name: key.name,
+    concurrency_limit: key.concurrency_limit ?? 0,
     group_id: key.group_id,
     status: key.status === 'quota_exhausted' || key.status === 'expired' ? 'inactive' : key.status,
     use_custom_key: false,
@@ -1662,6 +1693,13 @@ const confirmDelete = (key: ApiKey) => {
 }
 
 const handleSubmit = async () => {
+  if (concurrencyLimitError.value) {
+    appStore.showError(concurrencyLimitError.value)
+    return
+  }
+  // An empty input explicitly clears the saved key limit.
+  const concurrencyLimit = Number(formData.value.concurrency_limit)
+
   // Validate group_id is required
   if (formData.value.group_id === null) {
     appStore.showError(t('keys.groupRequired'))
@@ -1720,6 +1758,7 @@ const handleSubmit = async () => {
     if (showEditModal.value && selectedKey.value) {
       const updates: UpdateApiKeyRequest = {
         name: formData.value.name,
+        concurrency_limit: concurrencyLimit,
         group_id: formData.value.group_id,
         ip_whitelist: ipWhitelist,
         ip_blacklist: ipBlacklist,
@@ -1744,7 +1783,8 @@ const handleSubmit = async () => {
         ipBlacklist,
         quota,
         expiresInDays,
-        rateLimitData
+        rateLimitData,
+        concurrencyLimit
       )
       appStore.showSuccess(t('keys.keyCreatedSuccess'))
       // Only advance tour if active, on submit step, and creation succeeded
@@ -1789,6 +1829,7 @@ const closeModals = () => {
   selectedKey.value = null
   formData.value = {
     name: '',
+    concurrency_limit: 0,
     group_id: null,
     status: 'active',
     use_custom_key: false,

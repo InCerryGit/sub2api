@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"sync"
@@ -412,6 +413,47 @@ func (s *ConcurrencyService) AcquireUserSlot(ctx context.Context, userID int64, 
 		Acquired:    false,
 		ReleaseFunc: nil,
 	}, nil
+}
+
+// APIKeySlotAdmissionCache adds atomic admission to the shared statistics set.
+// A cache lacking admission support cannot admit a key with a configured limit.
+type APIKeySlotAdmissionCache interface {
+	APIKeyConcurrencyCache
+	AcquireAPIKeySlot(context.Context, int64, int, string) (bool, error)
+}
+
+// AcquireAPIKeySlot never waits for capacity. The caller owns ReleaseFunc,
+// including after cancellation: WS turns retain their slots while draining.
+// HTTP callers bind release to their request context at the helper boundary.
+func (s *ConcurrencyService) AcquireAPIKeySlot(ctx context.Context, apiKeyID int64, maxConcurrency int) (*AcquireResult, error) {
+	if maxConcurrency == 0 {
+		return &AcquireResult{Acquired: true, ReleaseFunc: s.TrackAPIKeySlot(context.WithoutCancel(ctx), apiKeyID)}, nil
+	}
+	if s == nil || s.cache == nil || apiKeyID <= 0 || maxConcurrency < 0 {
+		return nil, fmt.Errorf("API key concurrency admission unavailable")
+	}
+	cache, ok := s.cache.(APIKeySlotAdmissionCache)
+	if !ok {
+		return nil, fmt.Errorf("API key concurrency admission unavailable")
+	}
+	requestID := generateRequestID()
+	leaseCache, ok := s.cache.(APIKeySlotLeaseCache)
+	if !ok || leaseCache.APIKeySlotTTL() <= 2*time.Second || leaseCache.APIKeySlotRefreshInterval() <= 0 || !HasAPIKeyAdmissionOwner(ctx) {
+		return nil, fmt.Errorf("API key concurrency requires a renewable lease and cancellation owner")
+	}
+	started := time.Now()
+	acquireCtx, cancel := context.WithTimeout(ctx, apiKeySlotTrackTimeout)
+	acquired, err := cache.AcquireAPIKeySlot(acquireCtx, apiKeyID, maxConcurrency, requestID)
+	cancel()
+	if err != nil {
+		// The write may have succeeded even if its response was lost.
+		releaseAPIKeySlot(cache, apiKeyID, requestID)
+		return nil, fmt.Errorf("acquire API key %d concurrency slot: %w", apiKeyID, err)
+	}
+	if !acquired {
+		return &AcquireResult{Acquired: false}, nil
+	}
+	return &AcquireResult{Acquired: true, ReleaseFunc: keepEnforcedAPIKeySlot(ctx, leaseCache, apiKeyID, requestID, started)}, nil
 }
 
 // TrackAPIKeySlot records one active request slot for an API key without

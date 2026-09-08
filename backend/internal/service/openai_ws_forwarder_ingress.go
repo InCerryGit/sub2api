@@ -96,7 +96,7 @@ func (r *openAIWSIngressReader) closeAndJoin(status coderws.StatusCode, reason s
 
 func (r *openAIWSIngressReader) closeForControl(ctx context.Context) error {
 	cause := context.Cause(ctx)
-	if errors.Is(cause, ErrOpenAIWSIngressLeaseLost) {
+	if errors.Is(cause, ErrOpenAIWSIngressLeaseLost) || errors.Is(cause, ErrAPIKeySlotLeaseLost) {
 		return r.closeAndJoin(coderws.StatusTryAgainLater, "websocket ingress capacity lease lost; please reconnect", cause)
 	}
 	return r.closeAndJoin(coderws.StatusGoingAway, "websocket request canceled", cause)
