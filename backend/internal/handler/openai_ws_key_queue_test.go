@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/Wei-Shaw/sub2api/internal/testutil"
@@ -309,6 +310,106 @@ func TestOpenAIWSKeyWaitAcquiresAfterExternalRelease(t *testing.T) {
 	require.Zero(t, userCount)
 }
 
+// TestOpenAIWSKeyQueueAdmissionUsesCurrentTurnPermissions drives the real
+// Redis-backed worker admission twice with different per-turn permission
+// snapshots: each wait must revalidate against its own turn's models, and a
+// previous turn's snapshot must never leak into the next wait (run with -race).
+func TestOpenAIWSKeyQueueAdmissionUsesCurrentTurnPermissions(t *testing.T) {
+	helper, rawCache := newAPIKeyAdmissionHelper(t)
+	helper.concurrencyService.SetAPIKeyQueuePolicy(service.APIKeyQueuePolicy{MaxWaiting: 4, Timeout: 10 * time.Second})
+	queueCache, ok := rawCache.(service.APIKeySlotQueueCache)
+	require.True(t, ok)
+
+	var expectedMu sync.Mutex
+	expected := "model-a"
+	var observedMu sync.Mutex
+	var observed [][]string
+	baseCtx, cancelOwner := service.WithAPIKeyAdmissionOwner(context.Background())
+	defer cancelOwner()
+	revalidateCtx := service.WithAPIKeyQueueAuthRevalidator(baseCtx, func(ctx context.Context) (int, error) {
+		permissions := service.APIKeyQueueRequestPermissionsFromContext(ctx)
+		observedMu.Lock()
+		observed = append(observed, append([]string(nil), permissions.Models...))
+		observedMu.Unlock()
+		expectedMu.Lock()
+		want := expected
+		expectedMu.Unlock()
+		if len(permissions.Models) != 1 || permissions.Models[0] != want {
+			return 0, service.NewAPIKeyQueueAuthRejected(
+				infraerrors.Forbidden("MODEL_NOT_ALLOWED", "turn permissions leaked"),
+			)
+		}
+		return 1, nil
+	})
+
+	admitTurn := func(t *testing.T, apiKeyID int64, model string) wsKeyQueueAdmission {
+		t.Helper()
+		expectedMu.Lock()
+		expected = model
+		expectedMu.Unlock()
+
+		holderCtx, cancelHolder := service.WithAPIKeyAdmissionOwner(context.Background())
+		defer cancelHolder()
+		holder, err := helper.concurrencyService.ReserveAPIKeySlotWithWait(holderCtx, apiKeyID, 1)
+		require.NoError(t, err)
+
+		client, serverConn := startHandlerKeyQueueConn(t)
+		defer func() { _ = client.CloseNow() }()
+		turnCtx := service.WithAPIKeyQueueRequestPermissions(revalidateCtx, service.APIKeyQueueRequestPermissions{Models: []string{model}})
+		resultCh := runHandlerKeyQueueAdmission(t, helper, turnCtx, serverConn, apiKeyID, 1)
+		requireQueueWaiting(t, queueCache, apiKeyID, 1)
+		holder.Release()
+		got := waitHandlerKeyQueueAdmission(t, resultCh)
+		require.NoError(t, got.err)
+		require.True(t, got.acquired)
+		require.NotNil(t, got.release)
+		got.release()
+		return got
+	}
+
+	admitTurn(t, 333, "model-a")
+	observedMu.Lock()
+	firstTurnObserved := append([][]string(nil), observed...)
+	observedMu.Unlock()
+	require.NotEmpty(t, firstTurnObserved)
+	for _, models := range firstTurnObserved {
+		require.Equal(t, []string{"model-a"}, models)
+	}
+
+	admitTurn(t, 333, "model-b")
+	observedMu.Lock()
+	secondTurnObserved := append([][]string(nil), observed[len(firstTurnObserved):]...)
+	observedMu.Unlock()
+	require.NotEmpty(t, secondTurnObserved)
+	for _, models := range secondTurnObserved {
+		require.Equal(t, []string{"model-b"}, models, "the second wait must not see the first turn's snapshot")
+	}
+}
+
+func TestOpenAIWSQueueTurnPermissionsPerTurnScope(t *testing.T) {
+	// The actual/effective model is prepended to the frame's own candidates, so
+	// a frame that already carries it yields a duplicate. Duplicates are
+	// harmless for the allowlist predicates and preserve the existing
+	// turn>1 candidate order.
+	text := openAIWSQueueTurnPermissions("gpt-5.4", []byte(`{"type":"response.create","model":"gpt-5.4","input":"hi"}`))
+	require.Equal(t, []string{"gpt-5.4", "gpt-5.4"}, text.Models)
+	require.Zero(t, text.Capabilities&service.APIKeyQueueCapabilityImageGeneration)
+
+	image := openAIWSQueueTurnPermissions("gpt-5.4", []byte(`{"type":"response.create","model":"gpt-5.4","tools":[{"type":"image_generation"}],"input":"draw"}`))
+	require.Equal(t, []string{"gpt-5.4", "gpt-5.4"}, image.Models)
+	require.NotZero(t, image.Capabilities&service.APIKeyQueueCapabilityImageGeneration, "native image tool marks the image capability")
+
+	// Duplicate and case-variant model keys stay in the candidate set, and each
+	// turn's context keeps its own snapshot after the next turn is installed.
+	duplicates := openAIWSQueueTurnPermissions("gpt-5.4", []byte(`{"model":"gpt-5.4","Model":"gpt-4"}`))
+	require.Equal(t, []string{"gpt-5.4", "gpt-5.4", "gpt-4"}, duplicates.Models)
+
+	ctxFirst := service.WithAPIKeyQueueRequestPermissions(context.Background(), text)
+	ctxSecond := service.WithAPIKeyQueueRequestPermissions(ctxFirst, image)
+	require.Zero(t, service.APIKeyQueueRequestPermissionsFromContext(ctxFirst).Capabilities&service.APIKeyQueueCapabilityImageGeneration)
+	require.NotZero(t, service.APIKeyQueueRequestPermissionsFromContext(ctxSecond).Capabilities&service.APIKeyQueueCapabilityImageGeneration)
+}
+
 // TestOpenAIWSFirstTurnKeyWaitPreservesLeaseCause keeps the typed retryable
 // close (1013) and the original ingress lease cause for control cancellation.
 func TestOpenAIWSFirstTurnKeyWaitPreservesLeaseCause(t *testing.T) {
@@ -501,4 +602,123 @@ func TestOpenAIResponsesWebSocketFirstTurnKeyWaitEndsWithoutUpstream(t *testing.
 			require.Zero(t, userCount, "an unadmitted first turn must not hold a user slot")
 		})
 	}
+}
+
+// TestOpenAIResponsesWebSocketFirstTurnCarriesPermissionsToWorker pins the
+// first-turn ctx wiring: the immutable per-turn permissions must be installed
+// before the handler's first key admission so the waiting worker revalidates
+// against the actual first-frame model and image intent, not an empty snapshot.
+func TestOpenAIResponsesWebSocketFirstTurnCarriesPermissionsToWorker(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	redisCache := testutil.NewRedisConcurrencyCache(t)
+	queueCache, ok := redisCache.(service.APIKeySlotQueueCache)
+	require.True(t, ok)
+	helper := NewConcurrencyHelper(service.NewConcurrencyService(redisCache), SSEPingFormatNone, time.Millisecond)
+	helper.concurrencyService.SetAPIKeyQueuePolicy(service.APIKeyQueuePolicy{MaxWaiting: 4, Timeout: 30 * time.Second})
+
+	const apiKeyID, userID = int64(1802), int64(1702)
+	holderCtx, cancelHolder := service.WithAPIKeyAdmissionOwner(context.Background())
+	defer cancelHolder()
+	holder, err := helper.concurrencyService.ReserveAPIKeySlotWithWait(holderCtx, apiKeyID, 1)
+	require.NoError(t, err)
+	defer holder.Release()
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, acceptErr := coderws.Accept(w, r, nil)
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		_, _, _ = conn.Read(r.Context())
+	}))
+	defer upstreamServer.Close()
+
+	groupID := int64(4202)
+	account := service.Account{
+		ID: 9902, Name: "openai-ws-first-turn-permissions", Platform: service.PlatformOpenAI,
+		Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Concurrency: 1,
+		Credentials: map[string]any{"api_key": "sk-test", "base_url": upstreamServer.URL},
+		Extra: map[string]any{
+			"openai_apikey_responses_websockets_v2_enabled": true,
+			"openai_apikey_responses_websockets_v2_mode":    service.OpenAIWSIngressModePassthrough,
+		},
+	}
+	cfg := &config.Config{}
+	cfg.RunMode = config.RunModeSimple
+	cfg.Default.RateMultiplier = 1
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+	cfg.Gateway.OpenAIWS.DialTimeoutSeconds = 3
+	cfg.Gateway.OpenAIWS.ReadTimeoutSeconds = 3
+	cfg.Gateway.OpenAIWS.WriteTimeoutSeconds = 3
+
+	billingCacheSvc := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+	gatewaySvc := service.NewOpenAIGatewayService(
+		&openAIWSUsageHandlerAccountRepoStub{account: account},
+		&openAIWSUsageHandlerUsageLogRepoStub{},
+		nil, nil, nil, nil, nil,
+		cfg,
+		nil, nil,
+		service.NewBillingService(cfg, nil),
+		nil,
+		billingCacheSvc,
+		nil,
+		&service.DeferredService{},
+		nil, nil, nil, nil, nil, nil, nil,
+	)
+	h := &OpenAIGatewayHandler{
+		gatewayService:      gatewaySvc,
+		billingCacheService: billingCacheSvc,
+		apiKeyService:       &service.APIKeyService{},
+		concurrencyHelper:   helper,
+	}
+
+	apiKey := &service.APIKey{ID: apiKeyID, GroupID: &groupID, ConcurrencyLimit: 1, User: &service.User{ID: userID, Status: service.StatusActive}}
+	ownerCtx, cancelOwner := service.WithAPIKeyAdmissionOwner(context.Background())
+	defer cancelOwner()
+	var observedMu sync.Mutex
+	var observed []service.APIKeyQueueRequestPermissions
+	ownerCtx = service.WithAPIKeyQueueAuthRevalidator(ownerCtx, func(ctx context.Context) (int, error) {
+		permissions := service.APIKeyQueueRequestPermissionsFromContext(ctx)
+		observedMu.Lock()
+		observed = append(observed, permissions)
+		observedMu.Unlock()
+		if len(permissions.Models) == 0 {
+			return 0, service.NewAPIKeyQueueAuthRejected(infraerrors.Forbidden("MODEL_NOT_ALLOWED", "first turn lost its permissions"))
+		}
+		return 1, nil
+	})
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Request = c.Request.WithContext(ownerCtx)
+		c.Set(string(middleware.ContextKeyAPIKey), apiKey)
+		c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: apiKey.User.ID, Concurrency: 1})
+		c.Next()
+	})
+	router.GET("/openai/v1/responses", h.ResponsesWebSocket)
+	handlerServer := httptest.NewServer(router)
+	defer handlerServer.Close()
+
+	client, _, err := coderws.Dial(context.Background(), "ws"+strings.TrimPrefix(handlerServer.URL, "http")+"/openai/v1/responses", nil)
+	require.NoError(t, err)
+	defer func() { _ = client.CloseNow() }()
+	require.NoError(t, client.Write(context.Background(), coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.4","tools":[{"type":"image_generation"}],"input":"draw"}`)))
+	requireQueueWaiting(t, queueCache, apiKeyID, 1)
+
+	observedMu.Lock()
+	snapshot := append([]service.APIKeyQueueRequestPermissions(nil), observed...)
+	observedMu.Unlock()
+	require.NotEmpty(t, snapshot, "the first admission must revalidate before entering the queue")
+	for _, permissions := range snapshot {
+		require.Contains(t, permissions.Models, "gpt-5.4", "the worker must see the first frame's model")
+		require.NotZero(t, permissions.Capabilities&service.APIKeyQueueCapabilityImageGeneration, "the worker must see the first frame's image intent")
+	}
+
+	holder.Release()
+	requireQueueWaiting(t, queueCache, apiKeyID, 0)
 }

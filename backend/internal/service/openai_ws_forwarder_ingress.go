@@ -869,7 +869,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			normalized = litePayload
 		}
 		apiKey := getAPIKeyFromContext(c)
-		imageGenerationAllowed := GroupAllowsImageGeneration(apiKeyGroup(apiKey))
+		imageGenerationAllowed := GroupAllowsImageGenerationLatest(ctx, apiKeyGroup(apiKey))
 		codexImageGenerationExplicitToolPolicy := codexImageGenerationExplicitToolPolicyAllow
 		if isCodexCLI {
 			codexImageGenerationExplicitToolPolicy = account.CodexImageGenerationExplicitToolPolicy()
@@ -1011,6 +1011,21 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			payloadBytes:             len(normalized),
 			requestedReasoningEffort: requestedReasoningEffort,
 		}, nil
+	}
+
+	// preflightFollowupPayload runs the frame's permission preflight before the
+	// parser applies permission-dependent rejection or transformation. It uses
+	// the same effective-model fallback the parser will use, so permissions are
+	// judged for the current frame rather than the previous model.
+	preflightFollowupPayload := func(turn int, raw []byte) error {
+		if hooks == nil || hooks.BeforePayloadParse == nil {
+			return nil
+		}
+		effectiveModel := strings.TrimSpace(gjson.GetBytes(raw, "model").String())
+		if effectiveModel == "" {
+			effectiveModel = ingressSessionOriginalModel
+		}
+		return hooks.BeforePayloadParse(turn, raw, effectiveModel)
 	}
 
 	writeClientMessage := func(message []byte) error {
@@ -1314,6 +1329,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					return nil
 				}
 				return fmt.Errorf("read client websocket request: %w", readErr)
+			}
+			if err := preflightFollowupPayload(turn+1, nextClientMessage); err != nil {
+				return err
 			}
 			nextPayload, parseErr := parseClientPayload(turn+1, nextClientMessage)
 			if parseErr != nil {
@@ -2461,6 +2479,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			return fmt.Errorf("read client websocket request: %w", readErr)
 		}
 
+		if err := preflightFollowupPayload(turn+1, nextClientMessage); err != nil {
+			return err
+		}
 		nextPayload, parseErr := parseClientPayload(turn+1, nextClientMessage)
 		if parseErr != nil {
 			return parseErr

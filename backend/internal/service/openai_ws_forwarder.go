@@ -263,6 +263,13 @@ type OpenAIWSIngressHooks struct {
 	TurnStarted             func(turn int, startedAt time.Time)
 	BeforeTurn              func(turn int) error
 	BeforeRequest           func(turn int, payload []byte, originalModel string) error
+	// BeforePayloadParse runs synchronously before parsing a follow-up client
+	// frame on the native/bridge path. Handlers run one bounded fresh
+	// authorization here and install the current frame's immutable permissions,
+	// so permission-dependent parser decisions (image permission rejection,
+	// Codex image bridge injection) read the latest revalidation instead of the
+	// previous turn's holder value. Optional; nil keeps the previous behavior.
+	BeforePayloadParse func(turn int, raw []byte, effectiveModel string) error
 	// MapRequestModel resolves the current turn's client model to the model
 	// that must be written into the upstream response.create frame.
 	MapRequestModel func(turn int, originalModel string) (string, error)

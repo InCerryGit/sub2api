@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -151,6 +152,165 @@ func apiKeyQueueAuthRevalidatorFromContext(ctx context.Context) APIKeyQueueAuthR
 	}
 	revalidator, _ := ctx.Value(apiKeyQueueAuthRevalidatorKey{}).(APIKeyQueueAuthRevalidator)
 	return revalidator
+}
+
+// HasAPIKeyQueueAuthRevalidator reports whether the request carries the
+// per-request revalidator. WS turns use it to keep the handshake allowlist as
+// defense-in-depth only when no fresh per-turn gate was installed.
+func HasAPIKeyQueueAuthRevalidator(ctx context.Context) bool {
+	return apiKeyQueueAuthRevalidatorFromContext(ctx) != nil
+}
+
+// APIKeyQueueCapability identifies one group-gated capability that the current
+// request actually uses. The queue revalidator only re-checks capabilities a
+// request exercised, so unrelated group permission changes never interrupt a
+// wait.
+type APIKeyQueueCapability uint8
+
+const (
+	// APIKeyQueueCapabilityImageGeneration marks an explicit image-generation
+	// request (image endpoints or a native image_generation tool).
+	APIKeyQueueCapabilityImageGeneration APIKeyQueueCapability = 1 << iota
+	// APIKeyQueueCapabilityLive marks a Live creation request.
+	APIKeyQueueCapabilityLive
+	// APIKeyQueueCapabilityMessagesDispatch marks an OpenAI-compatible
+	// /v1/messages dispatch that was governed by the group switch (Grok/CN and
+	// composite-to-Grok/CN are exempt and must not record it).
+	APIKeyQueueCapabilityMessagesDispatch
+	// APIKeyQueueCapabilityForbiddenWhenClaudeCodeOnly marks an endpoint that a
+	// claude_code_only group rejects (/v1/chat/completions, /v1/responses).
+	APIKeyQueueCapabilityForbiddenWhenClaudeCodeOnly
+)
+
+// APIKeyQueueRequestPermissions is the immutable per-request authorization
+// requirement captured before admission: the client-written model candidates
+// (duplicate keys and case variants included) and the capabilities this request
+// actually uses. Middleware and the WS handler install it on the request/turn
+// context before waiting, so the revalidator never reads mutable Gin state.
+type APIKeyQueueRequestPermissions struct {
+	Models       []string
+	Capabilities APIKeyQueueCapability
+}
+
+type apiKeyQueueRequestPermissionsKey struct{}
+
+// WithAPIKeyQueueRequestPermissions installs or replaces the immutable
+// per-request permissions. The model slice is copied so callers cannot mutate
+// an admitted wait's snapshot afterwards.
+func WithAPIKeyQueueRequestPermissions(ctx context.Context, permissions APIKeyQueueRequestPermissions) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	if len(permissions.Models) > 0 {
+		permissions.Models = append([]string(nil), permissions.Models...)
+	}
+	return context.WithValue(ctx, apiKeyQueueRequestPermissionsKey{}, permissions)
+}
+
+// APIKeyQueueRequestPermissionsFromContext returns the permissions captured for
+// this request; the zero value means "no request-level checks".
+func APIKeyQueueRequestPermissionsFromContext(ctx context.Context) APIKeyQueueRequestPermissions {
+	if ctx == nil {
+		return APIKeyQueueRequestPermissions{}
+	}
+	permissions, _ := ctx.Value(apiKeyQueueRequestPermissionsKey{}).(APIKeyQueueRequestPermissions)
+	return permissions
+}
+
+// WithAPIKeyQueueCapability records that the current request actually uses one
+// more group-gated capability, preserving permissions already captured for the
+// same request.
+func WithAPIKeyQueueCapability(ctx context.Context, capability APIKeyQueueCapability) context.Context {
+	if ctx == nil || capability == 0 {
+		return ctx
+	}
+	permissions := APIKeyQueueRequestPermissionsFromContext(ctx)
+	permissions.Capabilities |= capability
+	return context.WithValue(ctx, apiKeyQueueRequestPermissionsKey{}, permissions)
+}
+
+// APIKeyQueueImagePermission is a tiny per-request holder the queue revalidator
+// updates with the freshest group image-generation permission it observed.
+// Forwarding gates read it so a permission changed after handshake (relaxed or
+// revoked) is judged from the latest revalidation instead of the handshake
+// Group snapshot. It deliberately stores one fact, not a Group replacement.
+type APIKeyQueueImagePermission struct {
+	mu      sync.Mutex
+	allowed bool
+	known   bool
+}
+
+// NewAPIKeyQueueImagePermission creates an unresolved permission holder.
+func NewAPIKeyQueueImagePermission() *APIKeyQueueImagePermission {
+	return &APIKeyQueueImagePermission{}
+}
+
+// Set records the latest observed image-generation permission.
+func (p *APIKeyQueueImagePermission) Set(allowed bool) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.allowed = allowed
+	p.known = true
+	p.mu.Unlock()
+}
+
+// Allowed returns the latest observed permission and whether one was recorded.
+func (p *APIKeyQueueImagePermission) Allowed() (bool, bool) {
+	if p == nil {
+		return false, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.allowed, p.known
+}
+
+type apiKeyQueueImagePermissionKey struct{}
+
+// WithAPIKeyQueueImagePermission installs the per-request permission holder.
+func WithAPIKeyQueueImagePermission(ctx context.Context, permission *APIKeyQueueImagePermission) context.Context {
+	if ctx == nil || permission == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, apiKeyQueueImagePermissionKey{}, permission)
+}
+
+// APIKeyQueueImagePermissionFromContext returns the installed holder, if any.
+func APIKeyQueueImagePermissionFromContext(ctx context.Context) *APIKeyQueueImagePermission {
+	if ctx == nil {
+		return nil
+	}
+	permission, _ := ctx.Value(apiKeyQueueImagePermissionKey{}).(*APIKeyQueueImagePermission)
+	return permission
+}
+
+// GroupAllowsImageGenerationLatest prefers the latest revalidated image
+// permission and falls back to the handshake group snapshot when no
+// revalidation has run for this request.
+func GroupAllowsImageGenerationLatest(ctx context.Context, group *Group) bool {
+	if permission := APIKeyQueueImagePermissionFromContext(ctx); permission != nil {
+		if allowed, known := permission.Allowed(); known {
+			return allowed
+		}
+	}
+	return GroupAllowsImageGeneration(group)
+}
+
+// RevalidateAPIKeyQueueTurn runs the request's installed revalidator once under
+// the same bounded context the wait loop uses. ok is false when no revalidator
+// is installed. WS turns call this before any capacity decision so unlimited or
+// queue-disabled keys still see fresh permissions.
+func (s *ConcurrencyService) RevalidateAPIKeyQueueTurn(ctx context.Context) (limit int, ok bool, err error) {
+	revalidator := apiKeyQueueAuthRevalidatorFromContext(ctx)
+	if revalidator == nil {
+		return 0, false, nil
+	}
+	limit, err = s.revalidateAPIKeyQueueAuth(ctx, revalidator)
+	if err != nil {
+		return 0, true, err
+	}
+	return limit, true, nil
 }
 
 func (e *APIKeyQueueError) Unwrap() error { return e.Cause }

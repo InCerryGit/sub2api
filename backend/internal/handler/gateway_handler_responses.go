@@ -116,6 +116,9 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 			"This group is restricted to Claude Code clients (/v1/messages only)")
 		return
 	}
+	if apiKey.Group != nil {
+		requireAPIKeyQueueCapability(c, service.APIKeyQueueCapabilityForbiddenWhenClaudeCodeOnly)
+	}
 
 	if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, reqModel, body); decision != nil && !decision.AllowNextStage {
 		h.responsesSecurityAuditError(c, decision)

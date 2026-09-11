@@ -3,8 +3,8 @@ package middleware
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
-	"reflect"
 	"strconv"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -15,20 +15,24 @@ import (
 
 func nextWithAPIKeyAdmissionOwner(c *gin.Context, apiKeyService *service.APIKeyService, credential string, trustedClientIP string, key *service.APIKey, googleStyle bool) {
 	var writer *apiKeyAdmissionWriter
-	if key.ConcurrencyLimit > 0 {
-		// Install the queue revalidator before the admission owner so both the
-		// request context and the owner's WithoutCancel-derived control context
-		// carry it: a waiting request stops immediately when the key is
-		// disabled/deleted/expired or its group, IP ACL and limit change.
+	// A WS connection outlives one capacity decision: install the revalidator
+	// (and its lightweight control owner) even when the handshake key is
+	// unlimited, so every turn still runs one bounded fresh authorization check.
+	// HTTP non-queue requests keep their existing shape.
+	installRevalidator := key.ConcurrencyLimit > 0 || isResponsesWebSocketRoute(c)
+	if installRevalidator {
 		base := service.WithAPIKeyQueueAuthRevalidator(
 			c.Request.Context(),
 			newAPIKeyQueueAuthRevalidator(apiKeyService, credential, trustedClientIP, key),
 		)
+		base = service.WithAPIKeyQueueImagePermission(base, service.NewAPIKeyQueueImagePermission())
 		ctx, cancel := service.WithAPIKeyAdmissionOwner(base)
 		defer cancel()
 		c.Request = c.Request.WithContext(ctx)
-		writer = &apiKeyAdmissionWriter{ResponseWriter: c.Writer, ctx: ctx, googleStyle: googleStyle, head: c.Request.Method == http.MethodHead}
-		c.Writer = writer
+		if key.ConcurrencyLimit > 0 {
+			writer = &apiKeyAdmissionWriter{ResponseWriter: c.Writer, ctx: ctx, googleStyle: googleStyle, head: c.Request.Method == http.MethodHead}
+			c.Writer = writer
+		}
 	}
 	c.Next()
 	// Gin finalizes its internal writer after middleware returns. Handle a blank
@@ -41,11 +45,14 @@ func nextWithAPIKeyAdmissionOwner(c *gin.Context, apiKeyService *service.APIKeyS
 // newAPIKeyQueueAuthRevalidator re-reads the authenticated key through the
 // existing auth cache (L1, then L2, with at most one database read after an
 // invalidation) and re-applies the same gates as initial authentication,
-// including the captured trusted client IP and group permission premises. It
-// closes over the credential but never logs it. A definite rejection stops the
+// including the captured trusted client IP and the permissions this request
+// actually still needs. The stable key/group identity is captured by value at
+// installation time so a benign group edit (name, pricing, routing, nil vs
+// empty collections) never aborts the wait. A definite rejection stops the
 // queue wait with the same application error the middleware would return; any
 // other failure is classified by the queue as a service error.
 func newAPIKeyQueueAuthRevalidator(apiKeyService *service.APIKeyService, credential string, trustedClientIP string, initial *service.APIKey) service.APIKeyQueueAuthRevalidator {
+	identity := captureAPIKeyQueueIdentity(initial)
 	return func(ctx context.Context) (int, error) {
 		if apiKeyService == nil || credential == "" || initial == nil {
 			return 0, service.NewAPIKeyQueueAuthRejected(infraerrors.ServiceUnavailable("API_KEY_AUTH_UNAVAILABLE", "API key authentication is temporarily unavailable"))
@@ -57,7 +64,7 @@ func newAPIKeyQueueAuthRevalidator(apiKeyService *service.APIKeyService, credent
 			}
 			return 0, service.NewAPIKeyQueueAuthRejected(infraerrors.ServiceUnavailable("API_KEY_AUTH_UNAVAILABLE", "API key authentication is temporarily unavailable"))
 		}
-		if latest == nil || latest.ID != initial.ID {
+		if latest == nil || latest.ID != identity.keyID {
 			return 0, service.NewAPIKeyQueueAuthRejected(infraerrors.Unauthorized("INVALID_API_KEY", "Invalid API key"))
 		}
 		// disabled / deleted / unknown status are unconditional rejections; an
@@ -91,31 +98,117 @@ func newAPIKeyQueueAuthRevalidator(apiKeyService *service.APIKeyService, credent
 				return 0, service.NewAPIKeyQueueAuthRejected(infraerrors.Forbidden("ACCESS_DENIED", "Access denied"))
 			}
 		}
-		if apiKeyQueuePermissionPremisesChanged(initial, latest) {
-			// The route authorization captured at authentication time is stale.
-			// Abort instead of forwarding under the old group/platform rights.
-			return 0, service.NewAPIKeyQueueAuthRejected(infraerrors.Forbidden("API_KEY_GROUP_CHANGED", "API key group changed while waiting; please retry"))
+		// A changed key binding, platform or charging mode must not keep the old
+		// route and the new authorization mixed; report a retryable configuration
+		// change instead of forwarding under stale premises. The reason code is
+		// kept for existing callers.
+		if apiKeyQueueCoreIdentityChanged(identity, latest) {
+			return 0, service.NewAPIKeyQueueAuthRejected(infraerrors.ServiceUnavailable("API_KEY_GROUP_CHANGED", "API key configuration changed; please retry"))
+		}
+		// Publish the freshest image permission for forwarding gates; a
+		// revalidation may have relaxed or revoked it since handshake.
+		if permission := service.APIKeyQueueImagePermissionFromContext(ctx); permission != nil {
+			permission.Set(service.GroupAllowsImageGeneration(latest.Group))
+		}
+		permissions := service.APIKeyQueueRequestPermissionsFromContext(ctx)
+		if blocked := apiKeyQueueBlockedModel(latest, permissions); blocked != "" {
+			return 0, service.NewAPIKeyQueueAuthRejected(infraerrors.NotFound("MODEL_NOT_ALLOWED", fmt.Sprintf("Model %q is not available for this group", blocked)))
+		}
+		if capabilityErr := apiKeyQueueRevokedCapability(latest, permissions); capabilityErr != nil {
+			return 0, service.NewAPIKeyQueueAuthRejected(capabilityErr)
 		}
 		return latest.ConcurrencyLimit, nil
 	}
 }
 
-// apiKeyQueuePermissionPremisesChanged treats any change to the captured group
-// authorization as stale: platform/status, exclusive binding, model allowlist
-// and routing, Live/messages/image permissions and client restrictions all gate
-// handler routes. Pricing-only edits are included as a conservative superset;
-// an aborted waiter re-authenticates and is re-routed with the fresh snapshot.
-func apiKeyQueuePermissionPremisesChanged(initial, latest *service.APIKey) bool {
-	if initial == nil || latest == nil {
+// apiKeyQueueInitialIdentity is the stable authorization identity captured by
+// value when the revalidator is installed. It deliberately excludes everything
+// that may legitimately change without affecting this request's permissions.
+type apiKeyQueueInitialIdentity struct {
+	keyID            int64
+	userID           int64
+	groupID          *int64
+	platform         string
+	subscriptionType string
+}
+
+func captureAPIKeyQueueIdentity(initial *service.APIKey) apiKeyQueueInitialIdentity {
+	identity := apiKeyQueueInitialIdentity{}
+	if initial == nil {
+		return identity
+	}
+	identity.keyID = initial.ID
+	identity.userID = initial.UserID
+	if initial.GroupID != nil {
+		groupID := *initial.GroupID
+		identity.groupID = &groupID
+	}
+	if initial.Group != nil {
+		identity.platform = initial.Group.Platform
+		identity.subscriptionType = initial.Group.SubscriptionType
+	}
+	return identity
+}
+
+// apiKeyQueueCoreIdentityChanged reports a genuine binding/platform/charging
+// change. Group existence and ID are compared, but no field snapshots: name,
+// pricing, routing, permission tweaks and nil/empty collection shapes are not
+// authorization identity.
+func apiKeyQueueCoreIdentityChanged(initial apiKeyQueueInitialIdentity, latest *service.APIKey) bool {
+	if latest == nil {
 		return true
 	}
-	if initial.GroupID == nil || latest.GroupID == nil {
-		return initial.GroupID != latest.GroupID
-	}
-	if *initial.GroupID != *latest.GroupID {
+	if initial.userID != 0 && latest.UserID != initial.userID {
 		return true
 	}
-	return !reflect.DeepEqual(initial.Group, latest.Group)
+	if (initial.groupID == nil) != (latest.GroupID == nil) {
+		return true
+	}
+	if initial.groupID != nil && *initial.groupID != *latest.GroupID {
+		return true
+	}
+	platform, subscriptionType := "", ""
+	if latest.Group != nil {
+		platform = latest.Group.Platform
+		subscriptionType = latest.Group.SubscriptionType
+	}
+	return initial.platform != platform || initial.subscriptionType != subscriptionType
+}
+
+// apiKeyQueueBlockedModel re-checks only the client-written model candidates
+// this request may bind, and only when the latest group has the allowlist on.
+func apiKeyQueueBlockedModel(latest *service.APIKey, permissions service.APIKeyQueueRequestPermissions) string {
+	if latest == nil || latest.Group == nil || !latest.Group.ModelAllowlistEnabled() {
+		return ""
+	}
+	for _, candidate := range permissions.Models {
+		if !latest.Group.ModelAllowlist.Allows(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// apiKeyQueueRevokedCapability denies only capabilities the current request
+// actually uses. An unrelated permission flip is ignored.
+func apiKeyQueueRevokedCapability(latest *service.APIKey, permissions service.APIKeyQueueRequestPermissions) error {
+	if latest == nil || latest.Group == nil || permissions.Capabilities == 0 {
+		return nil
+	}
+	group := latest.Group
+	if permissions.Capabilities&service.APIKeyQueueCapabilityForbiddenWhenClaudeCodeOnly != 0 && group.ClaudeCodeOnly {
+		return infraerrors.Forbidden("CLAUDE_CODE_ONLY", "This group is restricted to Claude Code clients (/v1/messages only)")
+	}
+	if permissions.Capabilities&service.APIKeyQueueCapabilityMessagesDispatch != 0 && !group.AllowMessagesDispatch {
+		return infraerrors.Forbidden("MESSAGES_DISPATCH_NOT_ALLOWED", "This group does not allow /v1/messages dispatch")
+	}
+	if permissions.Capabilities&service.APIKeyQueueCapabilityLive != 0 && !group.AllowLive {
+		return infraerrors.Forbidden("LIVE_NOT_ALLOWED", "Live is not enabled for this group")
+	}
+	if permissions.Capabilities&service.APIKeyQueueCapabilityImageGeneration != 0 && !service.GroupAllowsImageGeneration(group) {
+		return infraerrors.Forbidden("IMAGE_GENERATION_NOT_ALLOWED", service.ImageGenerationPermissionMessage())
+	}
+	return nil
 }
 
 type apiKeyAdmissionWriter struct {

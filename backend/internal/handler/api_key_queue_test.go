@@ -64,8 +64,47 @@ func TestOpenAIWSQueueErrorsUseTypedCloseCodes(t *testing.T) {
 		openAIWSUserSlotAcquireError(&service.APIKeyQueueError{Kind: service.APIKeyQueueErrorFull}).StatusCode())
 	require.Equal(t, coderws.StatusTryAgainLater,
 		openAIWSUserSlotAcquireError(&service.APIKeyQueueError{Kind: service.APIKeyQueueErrorTimeout}).StatusCode())
-	require.Equal(t, coderws.StatusInternalError,
+	// Capacity, policy and temporary verification faults are retryable.
+	require.Equal(t, coderws.StatusTryAgainLater,
 		openAIWSUserSlotAcquireError(&service.APIKeyQueueError{Kind: service.APIKeyQueueErrorUnavailable}).StatusCode())
+	require.Equal(t, coderws.StatusTryAgainLater,
+		openAIWSUserSlotAcquireError(&service.APIKeyQueueError{Kind: service.APIKeyQueueErrorPolicyChanged}).StatusCode())
+
+	// A definite permission failure stays 1008 with its business text.
+	require.Equal(t, coderws.StatusPolicyViolation, openAIWSUserSlotAcquireError(&service.APIKeyQueueError{
+		Kind:  service.APIKeyQueueErrorAuthRejected,
+		Cause: infraerrors.Forbidden("LIVE_NOT_ALLOWED", "Live is not enabled for this group"),
+	}).StatusCode())
+	modelDenied := openAIWSUserSlotAcquireError(&service.APIKeyQueueError{
+		Kind:  service.APIKeyQueueErrorAuthRejected,
+		Cause: infraerrors.NotFound("MODEL_NOT_ALLOWED", `Model "gpt-5.4" is not available for this group`),
+	})
+	require.Equal(t, coderws.StatusPolicyViolation, modelDenied.StatusCode())
+	require.Contains(t, modelDenied.Reason(), "not available for this group")
+
+	// Quota exhaustion is a definite business rejection, not a retryable
+	// configuration change, even though it maps to HTTP 429 elsewhere.
+	require.Equal(t, coderws.StatusPolicyViolation, openAIWSUserSlotAcquireError(&service.APIKeyQueueError{
+		Kind:  service.APIKeyQueueErrorAuthRejected,
+		Cause: infraerrors.TooManyRequests("API_KEY_QUOTA_EXHAUSTED", "API key 额度已用完"),
+	}).StatusCode())
+
+	// The two 503 flavors are both retryable but must stay distinguishable:
+	// only the core binding change is a configuration change.
+	coreChanged := openAIWSUserSlotAcquireError(&service.APIKeyQueueError{
+		Kind:  service.APIKeyQueueErrorAuthRejected,
+		Cause: infraerrors.ServiceUnavailable("API_KEY_GROUP_CHANGED", "API key configuration changed; please retry"),
+	})
+	authUnavailable := openAIWSUserSlotAcquireError(&service.APIKeyQueueError{
+		Kind:  service.APIKeyQueueErrorAuthRejected,
+		Cause: infraerrors.ServiceUnavailable("API_KEY_AUTH_UNAVAILABLE", "API key authentication is temporarily unavailable"),
+	})
+	require.Equal(t, coderws.StatusTryAgainLater, coreChanged.StatusCode())
+	require.Equal(t, coderws.StatusTryAgainLater, authUnavailable.StatusCode())
+	require.Contains(t, coreChanged.Reason(), "configuration changed")
+	require.Contains(t, authUnavailable.Reason(), "temporarily unavailable")
+	require.NotEqual(t, coreChanged.Reason(), authUnavailable.Reason())
+	require.NotContains(t, coreChanged.Reason(), "while waiting")
 }
 
 func TestParseAPIKeyQueueStatsIDs(t *testing.T) {

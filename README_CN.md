@@ -734,6 +734,7 @@ gateway:
 
 - 等待名额按 Key 独立计算，不是全局共享池：`20` 表示每个受限 Key 最多 20 个等待请求；`concurrency_limit: 0` 的 Key 不进入队列。
 - 队列用于 HTTP/SSE 转发以及 OpenAI Responses WebSocket 每轮请求和 Live 创建的 Key 准入。不保证 FIFO，空出的槽位由竞争中的等待者获得。
+- 等待期间只复核当前请求实际使用的权限：分组名称、价格、路由调优等无关变更不会中断等待；Key/用户失效、当前模型或能力被撤销仍会拒绝；Key 换组、平台或计费模式变化返回可重试的 `503` / `API_KEY_GROUP_CHANGED`。WebSocket 上确定的鉴权/权限失败以 `1008` 关闭，容量与临时服务/配置错误以 `1013` 关闭。
 - `GATEWAY_API_KEY_QUEUE_MAX_WAITING=0` 时，达到 Key 并发上限立即返回 HTTP `429` 和错误码 `gateway_concurrency_limit`；等待名额已满返回 `429` / `api_key_queue_full`，等待超时返回 `429` / `api_key_queue_timeout`。
 - 两个值都必须是整数：负数、小数、非法字符串或超出范围会在启动时报配置错误；即使关闭排队，`timeout_seconds` 仍必须为正整数。
 - 配置在进程启动时读取一次。Docker Compose 部署请在 `.env` 中设置后重建 `sub2api` 容器（`docker compose up -d`）；仅重启保留旧环境变量的容器不会生效。

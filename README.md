@@ -755,6 +755,13 @@ gateway:
 - The queue applies to key admission for HTTP/SSE forwarding and OpenAI
   Responses WebSocket turns and Live creation. It is not FIFO: a freed slot is
   taken by whichever waiter wins the race.
+- While a request waits, only the permissions that request actually uses are
+  re-checked: unrelated group edits (name, pricing, routing) do not interrupt
+  the wait; a disabled/expired key or user and a revoked model/capability are
+  still rejected; a changed key binding, platform or charging mode returns a
+  retryable `503` / `API_KEY_GROUP_CHANGED`. On WebSocket, definite
+  auth/permission failures close with `1008`, while capacity and temporary
+  service/configuration errors close with `1013`.
 - With `GATEWAY_API_KEY_QUEUE_MAX_WAITING=0`, reaching a key's limit fails fast
   with HTTP `429` and error code `gateway_concurrency_limit`; a full queue
   returns `429` / `api_key_queue_full`, and an expired wait returns `429` /

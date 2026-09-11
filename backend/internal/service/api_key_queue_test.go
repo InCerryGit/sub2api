@@ -583,3 +583,40 @@ func TestAPIKeyQueueAuthRevalidatorSurvivesContextDerivation(t *testing.T) {
 	require.Equal(t, 2, calls, "revalidator must stay visible through detachAPIKeyUpstreamContext")
 	reservation.Release()
 }
+
+// TestGroupAllowsImageGenerationLatestPrefersRevalidatedPermission pins the
+// service-forwarder correction: once the queue revalidator observed the latest
+// image permission, gates must use it instead of the stale handshake snapshot.
+func TestGroupAllowsImageGenerationLatestPrefersRevalidatedPermission(t *testing.T) {
+	disabled := &Group{AllowImageGeneration: false}
+	enabled := &Group{AllowImageGeneration: true}
+
+	require.False(t, GroupAllowsImageGenerationLatest(context.Background(), disabled), "no holder falls back to the group snapshot")
+	require.True(t, GroupAllowsImageGenerationLatest(context.Background(), enabled))
+
+	holder := NewAPIKeyQueueImagePermission()
+	ctx := WithAPIKeyQueueImagePermission(context.Background(), holder)
+	require.False(t, GroupAllowsImageGenerationLatest(ctx, disabled), "unresolved holder keeps the fallback")
+	require.True(t, GroupAllowsImageGenerationLatest(ctx, enabled))
+
+	holder.Set(true)
+	require.True(t, GroupAllowsImageGenerationLatest(ctx, disabled), "a revalidated relaxation must win over the handshake snapshot")
+	holder.Set(false)
+	require.False(t, GroupAllowsImageGenerationLatest(ctx, enabled), "a revalidated revocation must win over the handshake snapshot")
+}
+
+func TestRevalidateAPIKeyQueueTurnReportsInstalledCallback(t *testing.T) {
+	svc := NewConcurrencyService(nil)
+	limit, ok, err := svc.RevalidateAPIKeyQueueTurn(context.Background())
+	require.NoError(t, err)
+	require.False(t, ok, "no installed callback means no per-turn revalidation")
+	require.Zero(t, limit)
+
+	ctx := WithAPIKeyQueueAuthRevalidator(context.Background(), func(context.Context) (int, error) {
+		return 2, nil
+	})
+	limit, ok, err = svc.RevalidateAPIKeyQueueTurn(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 2, limit)
+}

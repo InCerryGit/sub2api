@@ -144,7 +144,7 @@ func admitOpenAIWSTurn(
 	keyLimit int,
 ) (func(), bool, error) {
 	reservation, err := service.WaitOpenAIWSKeyAdmission(ctx, c, func(waitCtx context.Context) (*service.APIKeySlotReservation, error) {
-		return h.ReserveAPIKeySlotWithWait(waitCtx, apiKeyID, keyLimit)
+		return h.ReserveWSAPIKeySlotWithWait(waitCtx, apiKeyID, keyLimit)
 	})
 	if err != nil {
 		return nil, false, err
@@ -170,6 +170,19 @@ func admitOpenAIWSTurn(
 			reservation.Release()
 		}
 	}), true, nil
+}
+
+// openAIWSQueueTurnPermissions builds one WS response.create turn's immutable
+// queue-permission snapshot: the actual/effective model plus every client model
+// candidate in the frame, and the turn's explicit image-generation intent. Each
+// turn gets its own value so a waiting worker never reads shared Gin state.
+func openAIWSQueueTurnPermissions(model string, payload []byte) service.APIKeyQueueRequestPermissions {
+	candidates := append([]string{model}, requestmodel.FromBodyCandidates("", "application/json", payload)...)
+	capabilities := service.APIKeyQueueCapability(0)
+	if service.IsExplicitImageGenerationIntent("/v1/responses", model, payload) {
+		capabilities = service.APIKeyQueueCapabilityImageGeneration
+	}
+	return service.APIKeyQueueRequestPermissions{Models: candidates, Capabilities: capabilities}
 }
 
 // closeOpenAIWSAdmissionError maps a first-turn admission failure to the same
@@ -449,6 +462,16 @@ func openAIResponsesRequiredCapabilityForRequest(imageIntent bool, needsResponse
 }
 
 func allowOpenAICompatibleMessagesDispatch(c *gin.Context, apiKey *service.APIKey) bool {
+	if openAICompatibleMessagesDispatchExempt(c, apiKey) {
+		return true
+	}
+	return apiKey.Group.AllowMessagesDispatch
+}
+
+// openAICompatibleMessagesDispatchExempt reports platforms whose native
+// protocol is /v1/messages: Grok, CN providers, and composite groups resolved
+// to either. Those must not record the group dispatch switch as a requirement.
+func openAICompatibleMessagesDispatchExempt(c *gin.Context, apiKey *service.APIKey) bool {
 	if apiKey == nil || apiKey.Group == nil {
 		return true
 	}
@@ -470,7 +493,16 @@ func allowOpenAICompatibleMessagesDispatch(c *gin.Context, apiKey *service.APIKe
 			return true
 		}
 	}
-	return apiKey.Group.AllowMessagesDispatch
+	return false
+}
+
+// requireMessagesDispatchQueueCapability records the group dispatch switch as a
+// required permission only when that switch actually governs this request.
+func requireMessagesDispatchQueueCapability(c *gin.Context, apiKey *service.APIKey) {
+	if openAICompatibleMessagesDispatchExempt(c, apiKey) {
+		return
+	}
+	requireAPIKeyQueueCapability(c, service.APIKeyQueueCapabilityMessagesDispatch)
 }
 
 func openAICompatibleTextTargetAllowed(c *gin.Context, apiKey *service.APIKey, model string) bool {
@@ -701,6 +733,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	}
 	var imageReleaseFunc func()
 	if imageIntent {
+		requireAPIKeyQueueCapability(c, service.APIKeyQueueCapabilityImageGeneration)
 		var imageAcquired bool
 		imageReleaseFunc, imageAcquired = h.acquireImageGenerationSlot(c, streamStarted)
 		if !imageAcquired {
@@ -1311,6 +1344,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			"This group does not allow /v1/messages dispatch")
 		return
 	}
+	requireMessagesDispatchQueueCapability(c, apiKey)
 
 	if !h.ensureResponsesDependencies(c, reqLog) {
 		return
@@ -2553,8 +2587,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	// 分组级模型白名单：首帧校验客户端模型，不通过则关闭连接并标记运维原因。
 	// 必须在 ensureCompositeTargetPlatform（合成路由改写）之前执行。
 	// 与 HTTP 准入一致：帧内重复 model 键/大小写变体可能被上游按末值绑定，
-	// 全部候选值逐一校验，任一未命中即拒绝。
-	if blocked := blockedModelAllowlistCandidate(apiKey.Group, requestmodel.FromBodyCandidates("", "application/json", firstMessage)); blocked != "" {
+	// 全部候选值逐一校验，任一未命中即拒绝。同一快照同时作为本轮队列复核的
+	// 不可变权限，等待 worker 不读取 Gin 上下文。
+	firstTurnQueuePermissions := openAIWSQueueTurnPermissions(reqModel, firstMessage)
+	if blocked := blockedModelAllowlistCandidate(apiKey.Group, firstTurnQueuePermissions.Models); blocked != "" {
 		service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalModelConfiguration)
 		middleware2.MarkIngressRejected(c, middleware2.IngressRejectModelNotAllowed)
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, fmt.Sprintf("Model %q is not available for this group", blocked))
@@ -2592,7 +2628,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		return
 	}
 
-	imageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, firstMessage)
+	imageIntent := firstTurnQueuePermissions.Capabilities&service.APIKeyQueueCapabilityImageGeneration != 0
 	if imageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, service.ImageGenerationPermissionMessage())
 		return
@@ -2645,6 +2681,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	// 必须尽早注册，确保任何 early return 都能释放已获取的并发槽位。
 	defer releaseTurnSlots()
 
+	// 首轮准入携带本轮的不可变权限快照；failover 重入复用同一 ctx 链条。
+	ctx = service.WithAPIKeyQueueRequestPermissions(ctx, firstTurnQueuePermissions)
 	userReleaseFunc, userAcquired, err := admitOpenAIWSTurn(h.concurrencyHelper, ctx, c, subject.UserID, subject.Concurrency, apiKey.ID, apiKey.ConcurrencyLimit)
 	if err != nil {
 		closeOpenAIWSAdmissionError(wsConn, reqLog, "openai.websocket_user_slot_acquire_failed", err)
@@ -2949,6 +2987,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// turn 级定价：首轮回退到 TurnStarted 的所属 turn 时刻；后续 turn 由
 		// BeforeTurn 重新冻结 pricingAt 并按最新门复核当前账号。
 		var turnPricing openAIWSTurnPricing
+		// turnQueuePermissions 由 BeforeRequest 按当前 turn 覆写，BeforeTurn 在
+		// 同一连接循环内读取并复制为不可变 ctx 值，等待 worker 不再读取它。
+		var turnQueuePermissions service.APIKeyQueueRequestPermissions
+		var permissionsPreflightTurn int
 		hooks := &service.OpenAIWSIngressHooks{
 			ClientLifecycleContext:      clientLifecycleCtx,
 			InitialRequestModel:         reqModel,
@@ -2957,6 +2999,30 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			MaxReasoningEffortOverLimit: maxReasoningEffortOverLimit,
 			ReasoningEffortMappings:     reasoningEffortMappings,
 			TurnStarted:                 recordTurnStart,
+			BeforePayloadParse: func(turn int, raw []byte, effectiveModel string) error {
+				if turn <= 1 {
+					return nil
+				}
+				// One bounded fresh auth BEFORE the parser applies
+				// permission-dependent rejection/transformation. The current
+				// frame's permissions reach the revalidator here and refresh
+				// the value the parser trusts. No moderation, slot, or
+				// pricing work happens in this preflight.
+				if !gjson.ValidBytes(raw) {
+					return nil // the parser itself rejects the malformed frame
+				}
+				model := strings.TrimSpace(effectiveModel)
+				if model == "" {
+					model = reqModel
+				}
+				turnQueuePermissions = openAIWSQueueTurnPermissions(model, raw)
+				permissionsPreflightTurn = turn
+				turnCtx := service.WithAPIKeyQueueRequestPermissions(c.Request.Context(), turnQueuePermissions)
+				if err := h.concurrencyHelper.RevalidateTurnAuth(turnCtx); err != nil {
+					return mapOpenAIWSTurnAdmissionError(err)
+				}
+				return nil
+			},
 			BeforeRequest: func(turn int, payload []byte, originalModel string) error {
 				c.Set(securityAuditWSTurnContextKey, turn)
 				service.BeginOpsStreamTurn(c, turn)
@@ -2980,16 +3046,27 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if model == "" {
 					model = reqModel
 				}
-				// 分组级模型白名单：后续 turn 同样校验客户端模型（省略 model 时
-				// 沿用会话实际生效模型，含 session.update 轮换后的模型），不通过
-				// 则关闭整条连接，与推理强度 deny 一致。实际生效模型始终参与校验；
-				// 帧内重复 model 键/大小写变体/嵌套 session.model 额外逐一校验，
-				// 防止候选集非空时掩盖被轮换掉的禁用模型。
-				candidates := append([]string{model}, requestmodel.FromBodyCandidates("", "application/json", payload)...)
-				if blocked := blockedModelAllowlistCandidate(apiKey.Group, candidates); blocked != "" {
-					service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalModelConfiguration)
-					middleware2.MarkIngressRejected(c, middleware2.IngressRejectModelNotAllowed)
-					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, fmt.Sprintf("Model %q is not available for this group", blocked), nil)
+				// 分组级模型白名单：后续 turn 不再用建连时的快照终审——最新权限由
+				// 本轮准入的 revalidator 对下面捕获的当前模型候选集判定，白名单
+				// 放宽与收紧都在同一处生效。pre-parse 阶段已从原始帧捕获了实际
+				// 生效模型与全部候选；此处只合并解析后的能力（如解析器为客户端
+				// 注入的生图工具），不再重写候选集；无 pre-parse 的入口则保留
+				// 原解析载荷捕获语义。与 HTTP 一致：实际生效模型始终参与复核。
+				parsedQueuePermissions := openAIWSQueueTurnPermissions(model, payload)
+				if permissionsPreflightTurn != turn {
+					turnQueuePermissions = parsedQueuePermissions
+				} else {
+					turnQueuePermissions.Capabilities |= parsedQueuePermissions.Capabilities
+				}
+				// 真实 WS 链路必装 per-turn revalidator，本轮权限由它在准入时对
+				// 最新分组判定。仅在缺失（直接调用 handler 的嵌入场景）时保留
+				// 建连快照兜底，移除旧守卫不能留下无新校验的放行路径。
+				if !service.HasAPIKeyQueueAuthRevalidator(c.Request.Context()) {
+					if blocked := blockedModelAllowlistCandidate(apiKey.Group, turnQueuePermissions.Models); blocked != "" {
+						service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalModelConfiguration)
+						middleware2.MarkIngressRejected(c, middleware2.IngressRejectModelNotAllowed)
+						return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, fmt.Sprintf("Model %q is not available for this group", blocked), nil)
+					}
 				}
 				if decision := h.checkSecurityAuditStage(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, model, payload, "subsequent_turn"); decision != nil && !decision.AllowNextStage {
 					writeSecurityAuditWSError(ctx, wsConn, decision)
@@ -3038,8 +3115,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				// 非首轮 turn 重新抢占槽位，并只在全部准入完成后冻结本轮定价：
 				// Key 排队等待期间不得使用排队前时刻计价（计划 6.2.1）。等待期间
 				// 由连接唯一 reader 消费：首轮模式未定时识别 pending 取消；已建立
-				// 的 passthrough 还会拒绝重叠 response.create。
-				userReleaseFunc, accountReleaseFunc, err := h.admitOpenAIWSTurnForPricing(ctx, c, subject.UserID, subject.Concurrency, apiKey, account, accountMaxConcurrency, turn, reqLog, &turnPricing)
+				// 的 passthrough 还会拒绝重叠 response.create。等待 worker 只看到
+				// 本轮 BeforeRequest 生成的不可变权限。
+				turnQueueCtx := service.WithAPIKeyQueueRequestPermissions(ctx, turnQueuePermissions)
+				userReleaseFunc, accountReleaseFunc, err := h.admitOpenAIWSTurnForPricing(turnQueueCtx, c, subject.UserID, subject.Concurrency, apiKey, account, accountMaxConcurrency, turn, reqLog, &turnPricing)
 				if err != nil {
 					return err
 				}

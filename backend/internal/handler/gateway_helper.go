@@ -17,6 +17,16 @@ import (
 
 const gatewayStreamHeartbeatBytesKey = "gateway_stream_heartbeat_bytes"
 
+// requireAPIKeyQueueCapability records a group-gated capability that this
+// request actually uses, so a queued key wait re-checks exactly that capability
+// and ignores unrelated group permission changes.
+func requireAPIKeyQueueCapability(c *gin.Context, capability service.APIKeyQueueCapability) {
+	if c == nil || c.Request == nil || capability == 0 {
+		return
+	}
+	c.Request = c.Request.WithContext(service.WithAPIKeyQueueCapability(c.Request.Context(), capability))
+}
+
 func recordGatewayStreamHeartbeat(c *gin.Context, written int) {
 	if c == nil || written <= 0 {
 		return
@@ -396,6 +406,47 @@ func (h *ConcurrencyHelper) ReserveAPIKeySlotWithWait(ctx context.Context, apiKe
 		return nil, &ConcurrencyError{SlotType: "API key"}
 	}
 	return reservation, nil
+}
+
+// ReserveWSAPIKeySlotWithWait is the WS turn admission variant: every turn runs
+// one bounded fresh authorization check before deciding capacity, so unlimited
+// and queue-disabled keys still see per-turn revocations and expansions. The
+// refreshed limit is the one used for capacity, and only an enforced (limit > 0)
+// result touches Redis admission; limit 0 stays stats-only.
+func (h *ConcurrencyHelper) ReserveWSAPIKeySlotWithWait(ctx context.Context, apiKeyID int64, keyLimit int) (*service.APIKeySlotReservation, error) {
+	if h == nil || h.concurrencyService == nil {
+		if keyLimit != 0 {
+			return nil, fmt.Errorf("API key concurrency admission unavailable")
+		}
+		return nil, nil
+	}
+	refreshed, revalidated, err := h.concurrencyService.RevalidateAPIKeyQueueTurn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if revalidated {
+		keyLimit = refreshed
+	}
+	reservation, err := h.concurrencyService.ReserveAPIKeySlotWithWait(ctx, apiKeyID, keyLimit)
+	if err != nil {
+		return nil, err
+	}
+	if reservation == nil {
+		return nil, &ConcurrencyError{SlotType: "API key"}
+	}
+	return reservation, nil
+}
+
+// RevalidateTurnAuth runs the installed queue revalidator once under the
+// bounded admission context, or returns nil when no fresh gate is installed.
+// WS frame hooks call it ahead of payload parsing to refresh permissions for
+// the current frame; it performs no moderation, slot or pricing work.
+func (h *ConcurrencyHelper) RevalidateTurnAuth(ctx context.Context) error {
+	if h == nil || h.concurrencyService == nil {
+		return nil
+	}
+	_, _, err := h.concurrencyService.RevalidateAPIKeyQueueTurn(ctx)
+	return err
 }
 
 // AcquireAPIKeySlot covers HTTP forwarding endpoints without a user wait queue.

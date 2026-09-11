@@ -204,6 +204,7 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 			"This group does not allow /v1/messages dispatch")
 		return
 	}
+	requireMessagesDispatchQueueCapability(c, apiKey)
 
 	if !h.ensureResponsesDependencies(c, reqLog) {
 		return

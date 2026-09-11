@@ -38,6 +38,7 @@ func (h *OpenAIGatewayHandler) Live(c *gin.Context) {
 		h.errorResponse(c, http.StatusForbidden, "permission_error", "Live is not enabled for this group")
 		return
 	}
+	requireAPIKeyQueueCapability(c, service.APIKeyQueueCapabilityLive)
 	request, err := parseLiveCallRequest(c)
 	if err != nil {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", err.Error())
