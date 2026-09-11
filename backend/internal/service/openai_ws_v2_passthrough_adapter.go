@@ -611,6 +611,11 @@ func (c *openAIWSClientFrameConn) ReadFrame(ctx context.Context) (coderws.Messag
 			}
 		}()
 		for {
+			// Frames preserved while a key wait held this consumer keep their
+			// original order ahead of anything still in the channel.
+			if frame, ok := c.reader.popWaitFrame(); ok {
+				return frame.messageType, frame.payload, nil
+			}
 			if timeout == nil && c.waitingForNextTurn.Load() && c.interTurnIdleTimeout > 0 {
 				timer = time.NewTimer(c.interTurnIdleTimeout)
 				timeout = timer.C
@@ -992,6 +997,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	completedTurns := atomic.Int32{}
 	activeTurn := atomic.Int32{}
 	activeTurn.Store(1)
+	// A response.create accepted from the client is not upstream-active until
+	// its admission (including any key-queue wait) completes and the frame is
+	// about to be written. Until then a late terminal from the previous turn
+	// must not settle the pending turn's slots or usage.
+	pendingUpstreamTurn := atomic.Bool{}
 	// Relay joins both directions before returning, so no completion can race
 	// this fallback. Close upstream before releasing an unfinished turn.
 	defer func() {
@@ -1044,6 +1054,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				// it: AfterTurn also clears per-request audit state. The previous
 				// turn has already settled, so this cannot release its slots.
 				activeTurn.Store(completedTurns.Load() + 1)
+				pendingUpstreamTurn.Store(true)
 				defer func() {
 					if !acceptedTurn {
 						turnLifecycle.cancelResponseCreate()
@@ -1173,6 +1184,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				acceptedTurnStartedAt.Store(&responseCreateAtCopy)
 				acceptedTurn = true
 			}
+			if acceptedTurn {
+				// The frame is cleared for the upstream write that follows the
+				// relay's read; from here a terminal settles this turn again.
+				pendingUpstreamTurn.Store(false)
+			}
 			return out, blocked, policyErr
 		},
 		onBlock: func(blocked *OpenAIFastBlockedError) {
@@ -1253,6 +1269,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				)
 			},
 			OnTurnComplete: func(turn openaiwsv2.RelayTurnResult) {
+				if pendingUpstreamTurn.Load() {
+					// The only registered turn is still waiting for admission;
+					// a late terminal belongs to the settled previous turn.
+					return
+				}
 				if activeTurn.Swap(0) == 0 {
 					return
 				}

@@ -93,6 +93,15 @@ type APIKeySlotLeaseCache interface {
 // delayed reply. Reserve one second for Redis TIME rounding PLUS one third of
 // TTL for transport shutdown before Redis can admit another owner.
 func keepEnforcedAPIKeySlot(owner *apiKeyAdmissionOwner, cache APIKeySlotLeaseCache, keyID int64, requestID string, acknowledgedAt time.Time) func() {
+	release, _ := keepEnforcedAPIKeySlotState(owner, cache, keyID, requestID, acknowledgedAt)
+	return release
+}
+
+// keepEnforcedAPIKeySlotState returns the full stop+delete release and a
+// stop-only pause. The Live handoff pauses renewal before its atomic transfer,
+// so a removed regular member can never be reported as a lost lease, and the
+// original request release can only stop the successor, never delete it.
+func keepEnforcedAPIKeySlotState(owner *apiKeyAdmissionOwner, cache APIKeySlotLeaseCache, keyID int64, requestID string, acknowledgedAt time.Time) (release func(), pause func()) {
 	ttl := cache.APIKeySlotTTL()
 	margin := ttl/3 + time.Second
 	validFor := ttl - margin
@@ -146,14 +155,21 @@ func keepEnforcedAPIKeySlot(owner *apiKeyAdmissionOwner, cache APIKeySlotLeaseCa
 			}
 		}
 	}()
-	return sync.OnceFunc(func() {
+	// stopRenewal joins the refresh worker and the watchdog without removing the
+	// member. A late refresh reply cannot recreate it: RefreshAPIKeySlot only
+	// updates an existing member.
+	stopRenewal := sync.OnceFunc(func() {
 		watchdogMu.Lock()
 		lost = true
 		watchdog.Stop()
 		watchdogMu.Unlock()
 		cancelWorker()
 		<-done
+	})
+	release = sync.OnceFunc(func() {
+		stopRenewal()
 		// Only the forwarding owner removes capacity, after upstream shutdown.
 		releaseAPIKeySlot(cache, keyID, requestID)
 	})
+	return release, stopRenewal
 }

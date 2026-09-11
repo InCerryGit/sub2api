@@ -682,6 +682,24 @@ func (s *APIKeyService) currentConcurrencyForAPIKey(ctx context.Context, apiKeyI
 	return counts[apiKeyID]
 }
 
+// APIKeyQueuePolicy exposes the immutable key-queue policy of this process for
+// read-only metadata. It never consults the database.
+func (s *APIKeyService) APIKeyQueuePolicy() APIKeyQueuePolicy {
+	if s == nil || s.concurrencyService == nil {
+		return APIKeyQueuePolicy{}
+	}
+	return s.concurrencyService.APIKeyQueuePolicy()
+}
+
+// GetAPIKeyQueueStatsBatch returns active/waiting counts for the given keys.
+// An error means the snapshot is unknown; callers must not render zeroes.
+func (s *APIKeyService) GetAPIKeyQueueStatsBatch(ctx context.Context, apiKeyIDs []int64) (map[int64]APIKeyQueueCounts, error) {
+	if s == nil || s.concurrencyService == nil {
+		return nil, fmt.Errorf("api key queue statistics unavailable")
+	}
+	return s.concurrencyService.GetAPIKeyQueueStatsBatch(ctx, apiKeyIDs)
+}
+
 func (s *APIKeyService) VerifyOwnership(ctx context.Context, userID int64, apiKeyIDs []int64) ([]int64, error) {
 	if len(apiKeyIDs) == 0 {
 		return []int64{}, nil

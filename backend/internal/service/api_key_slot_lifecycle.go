@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -14,18 +16,25 @@ type APIKeySlotRefreshCache interface {
 	RefreshAPIKeySlot(context.Context, int64, string) (bool, error)
 }
 
-// One worker owns both renewal and removal. Cancellation joins that worker, so
-// no refresh can race after removal, including when the request context ends.
-func keepAPIKeySlot(ctx context.Context, cache APIKeyConcurrencyCache, apiKeyID int64, requestID string) func() {
+// keepAPIKeySlotState returns the full stop+delete release and a stop-only
+// pause used by the Live transfer: the stats-only member becomes the Live
+// member atomically, so the worker must be joined without deleting the
+// successor. An externally removed member is still recorded as a cleanup
+// exactly once.
+func keepAPIKeySlotState(ctx context.Context, cache APIKeyConcurrencyCache, apiKeyID int64, requestID string) (release func(), pause func()) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
+	var deleted atomic.Bool
+	deleteOnce := func() {
+		if deleted.CompareAndSwap(false, true) {
+			releaseAPIKeySlot(cache, apiKeyID, requestID)
+		}
+	}
 	go func() {
 		defer close(done)
-		defer cancel()
-		defer releaseAPIKeySlot(cache, apiKeyID, requestID)
 		var ticks <-chan time.Time
 		refresh, ok := cache.(APIKeySlotRefreshCache)
 		if ok && refresh.APIKeySlotRefreshInterval() > 0 {
@@ -45,15 +54,21 @@ func keepAPIKeySlot(ctx context.Context, cache APIKeyConcurrencyCache, apiKeyID 
 					logger.LegacyPrintf("service.concurrency", "Warning: failed to refresh api key slot for %d (req=%s): %v", apiKeyID, requestID, err)
 				} else if !exists {
 					// A manually removed or expired member must never be recreated.
+					deleteOnce()
 					return
 				}
 			}
 		}
 	}()
-	return func() {
+	stopRenewal := sync.OnceFunc(func() {
 		cancel()
 		<-done
-	}
+	})
+	release = sync.OnceFunc(func() {
+		stopRenewal()
+		deleteOnce()
+	})
+	return release, stopRenewal
 }
 
 func releaseAPIKeySlot(cache APIKeyConcurrencyCache, apiKeyID int64, requestID string) {

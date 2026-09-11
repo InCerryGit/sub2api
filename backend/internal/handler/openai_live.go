@@ -97,9 +97,19 @@ func (h *OpenAIGatewayHandler) Live(c *gin.Context) {
 		return
 	}
 
-	// The Live service atomically owns key capacity before opening upstream.
-	// Reserving a regular key member here would double-count the SDP handoff.
-	userRelease, acquired, err := h.concurrencyHelper.TryAcquireUserSlot(
+	// The Key wait (bounded by the global queue policy) happens before user and
+	// account capacity; the reservation is then transferred atomically into the
+	// Live lease so the same allowance is not counted twice.
+	keyReservation, err := h.concurrencyHelper.ReserveAPIKeySlotWithWait(c.Request.Context(), apiKey.ID, apiKey.ConcurrencyLimit)
+	if err != nil {
+		h.handleConcurrencyError(c, err, "API key", false)
+		return
+	}
+	if keyReservation != nil {
+		defer keyReservation.Release()
+	}
+
+	userResult, err := h.concurrencyHelper.AcquireLiveUserSlot(
 		c.Request.Context(),
 		subject.UserID,
 		subject.Concurrency,
@@ -108,13 +118,26 @@ func (h *OpenAIGatewayHandler) Live(c *gin.Context) {
 		h.handleConcurrencyError(c, err, "user", false)
 		return
 	}
-	if !acquired {
+	if !userResult.Acquired {
 		h.errorResponse(c, http.StatusTooManyRequests, "rate_limit_error", "Live concurrency limit reached")
 		return
 	}
-	defer userRelease()
+	if userResult.ReleaseFunc != nil {
+		defer userResult.ReleaseFunc()
+	}
 
 	identity := liveCallIdentity(c, apiKey, subject.UserID, subscription)
+	identity.KeyReservation = keyReservation
+	if keyReservation != nil {
+		// Use the limit that actually admitted the reservation: while waiting,
+		// the key may have changed to 0 (stats-only) or another positive limit.
+		// A stats-only reservation still has an exact member ID that the Live
+		// transfer consumes atomically, so no key renewal worker is orphaned.
+		identity.APIKeyConcurrencyLimit = keyReservation.EffectiveLimit()
+	}
+	// The exact user member is transferred into the Live lease; it is never
+	// counted alongside a second Live allowance.
+	identity.UserRequestID = userResult.RequestID
 	created, err := h.gatewayService.CreateLiveCall(c.Request.Context(), request, identity, subject.Concurrency)
 	if err != nil {
 		h.writeLiveCreateError(c, err)
@@ -186,7 +209,12 @@ func (h *OpenAIGatewayHandler) writeLiveCreateError(c *gin.Context, err error) {
 		h.errorResponse(c, http.StatusTooManyRequests, "rate_limit_error", "API key concurrency limit reached; please retry later")
 	case errors.Is(err, service.ErrLiveConcurrencyFull):
 		h.errorResponse(c, http.StatusTooManyRequests, "rate_limit_error", "Live concurrency limit reached")
-	case errors.Is(err, service.ErrLiveUnavailable), errors.Is(err, service.ErrAPIKeySlotLeaseLost):
+	case errors.Is(err, service.ErrLiveUnavailable),
+		errors.Is(err, service.ErrAPIKeySlotLeaseLost),
+		errors.Is(err, service.ErrAPIKeyReservationLost),
+		errors.Is(err, service.ErrLiveLeaseSourceLost),
+		errors.Is(err, service.ErrLiveLeaseTransferUncertain),
+		errors.Is(err, service.ErrLiveLeaseTransferFenced):
 		h.errorResponse(c, http.StatusServiceUnavailable, "api_error", "Live is unavailable")
 	default:
 		var attestationErr *service.LiveAttestationUnavailableError

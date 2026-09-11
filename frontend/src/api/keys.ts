@@ -4,7 +4,7 @@
  */
 
 import { apiClient } from './client'
-import type { ApiKey, CreateApiKeyRequest, UpdateApiKeyRequest, PaginatedResponse } from '@/types'
+import type { ApiKey, ApiKeyConcurrencySnapshot, CreateApiKeyRequest, UpdateApiKeyRequest, PaginatedResponse } from '@/types'
 
 /**
  * List all API keys for current user
@@ -133,7 +133,17 @@ export async function toggleStatus(id: number, status: 'active' | 'inactive'): P
   return update(id, { status })
 }
 
+/** Read actual queue policy and counts; omitting IDs requests policy only. */
+export async function getConcurrency(ids: number[] = [], options?: { signal?: AbortSignal }): Promise<ApiKeyConcurrencySnapshot> {
+  const { data } = await apiClient.get<ApiKeyConcurrencySnapshot>('/keys/concurrency', {
+    params: ids.length ? { ids: ids.join(',') } : {},
+    signal: options?.signal,
+  })
+  return data
+}
+
 export const keysAPI = {
+  getConcurrency,
   list,
   getById,
   create,

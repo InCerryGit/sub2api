@@ -66,7 +66,10 @@ func TestWSUserSlotAcquisitionRemainsCancellable(t *testing.T) {
 		synctest.Wait()
 		cancel()
 		<-done
-		require.Zero(t, cache.apiKeyTrackCalls)
+		// Key admission is attempted before the user slot (per the queue design),
+		// and a cancelled user acquisition must not leak the key handle.
+		require.Equal(t, 1, cache.apiKeyTrackCalls)
+		require.Equal(t, 1, cache.apiKeyReleaseCalls)
 	})
 }
 

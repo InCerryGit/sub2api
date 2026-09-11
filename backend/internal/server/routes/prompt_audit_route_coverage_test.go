@@ -100,9 +100,13 @@ func TestResponsesWebSocketHasFirstAndSubsequentTurnPromptGates(t *testing.T) {
 	require.NotEqual(t, -1, wsStart)
 	wsSource := string(handlerSource)[wsStart:]
 	firstGate := strings.Index(wsSource, `"first_turn"`)
-	firstSlot := strings.Index(wsSource, `TryAcquireWSUserSlotForAPIKey`)
+	// Per-turn admission runs through admitOpenAIWSTurn, which performs the Key
+	// wait (WaitOpenAIWSKeyAdmission) before any user slot.
+	firstSlot := strings.Index(wsSource, `admitOpenAIWSTurn(`)
 	require.NotEqual(t, -1, firstGate, "first-turn prompt gate must exist")
 	require.NotEqual(t, -1, firstSlot, "WS user/key slot acquisition must exist")
+	require.Contains(t, string(handlerSource), `WaitOpenAIWSKeyAdmission`)
+	require.Contains(t, string(handlerSource), `TryAcquireUserSlot`)
 	require.Less(t,
 		firstGate,
 		firstSlot,

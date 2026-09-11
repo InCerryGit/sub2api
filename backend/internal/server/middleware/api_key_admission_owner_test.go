@@ -35,7 +35,7 @@ func (*missingAdmissionLeaseCache) APIKeySlotTTL() time.Duration             { r
 func TestAPIKeyAdmissionOwnerChangesUncommittedFailureTo503(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
-		nextWithAPIKeyAdmissionOwner(c, &service.APIKey{ID: 1, ConcurrencyLimit: 1}, false)
+		nextWithAPIKeyAdmissionOwner(c, nil, "", "", &service.APIKey{ID: 1, ConcurrencyLimit: 1}, false)
 	})
 	router.GET("/forward", func(c *gin.Context) {
 		lease, err := service.NewConcurrencyService(&missingAdmissionLeaseCache{}).AcquireAPIKeySlot(c.Request.Context(), 1, 1)
@@ -59,7 +59,7 @@ func TestAPIKeyAdmissionOwnerGinFinalizationAndImplicitWrites(t *testing.T) {
 			t.Run(strconv.FormatBool(googleStyle)+"/"+variant, func(t *testing.T) {
 				router := gin.New()
 				router.Use(func(c *gin.Context) {
-					nextWithAPIKeyAdmissionOwner(c, &service.APIKey{ID: 1, ConcurrencyLimit: 1}, googleStyle)
+					nextWithAPIKeyAdmissionOwner(c, nil, "", "", &service.APIKey{ID: 1, ConcurrencyLimit: 1}, googleStyle)
 				})
 				method := http.MethodGet
 				if variant == "head" {
@@ -144,7 +144,7 @@ func TestAPIKeyAdmissionOwnerPreservesNormalAndCommittedResponses(t *testing.T) 
 				limit = 0
 			}
 			router.Use(func(c *gin.Context) {
-				nextWithAPIKeyAdmissionOwner(c, &service.APIKey{ID: 1, ConcurrencyLimit: limit}, false)
+				nextWithAPIKeyAdmissionOwner(c, nil, "", "", &service.APIKey{ID: 1, ConcurrencyLimit: limit}, false)
 			})
 			router.GET("/forward", func(c *gin.Context) {
 				require.Implements(t, (*http.Hijacker)(nil), c.Writer)

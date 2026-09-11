@@ -570,9 +570,10 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 			_ = s.service.refreshStickySessionTTL(ctx, req.GroupID, sessionHash, s.service.openAIWSSessionStickyTTL())
 		}
 		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
-			Account:     account,
-			Acquired:    true,
-			ReleaseFunc: result.ReleaseFunc,
+			Account:          account,
+			Acquired:         true,
+			ReleaseFunc:      result.ReleaseFunc,
+			AccountRequestID: result.RequestID,
 		}), false, nil
 	}
 
@@ -1228,9 +1229,10 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			_ = s.service.bindOpenAIStickySessionDuringSelection(ctx, req.GroupID, req.SessionHash, fresh.ID)
 		}
 		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
-			Account:     fresh,
-			Acquired:    true,
-			ReleaseFunc: result.ReleaseFunc,
+			Account:          fresh,
+			Acquired:         true,
+			ReleaseFunc:      result.ReleaseFunc,
+			AccountRequestID: result.RequestID,
 		}), compactBlocked, nil
 	}
 	return nil, compactBlocked, nil
@@ -1319,9 +1321,10 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 				_ = s.service.bindOpenAIStickySessionDuringSelection(ctx, req.GroupID, req.SessionHash, account.ID)
 			}
 			return attachSelectionProfitGate(ctx, &AccountSelectionResult{
-				Account:     account,
-				Acquired:    true,
-				ReleaseFunc: result.ReleaseFunc,
+				Account:          account,
+				Acquired:         true,
+				ReleaseFunc:      result.ReleaseFunc,
+				AccountRequestID: result.RequestID,
 			}), nil
 		}
 		if s.service.concurrencyService != nil {

@@ -754,6 +754,18 @@ export interface ApiKey {
   reset_7d_at: string | null
 }
 
+export interface ApiKeyConcurrencySnapshot {
+  queue_policy: {
+    max_waiting: number
+    timeout_seconds: number
+  }
+  items: Array<{
+    id: number
+    current_concurrency: number
+    current_waiting: number
+  }>
+}
+
 export interface CreateApiKeyRequest {
   name: string
   concurrency_limit?: number // 0 = no additional key limit
