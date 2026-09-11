@@ -175,11 +175,14 @@
           </template>
 
           <template #cell-current_concurrency="{ row }">
+            <template v-if="concurrencyRows[row.id]?.limit !== 0">
             <span
               :title="t('keys.concurrencyCount')"
               :class="[
                 'inline-flex items-center gap-1 rounded-md px-1.5 py-px text-xs font-normal leading-tight tabular-nums',
-                (concurrencyRows[row.id]?.current ?? 0) > 0
+                concurrencyRows[row.id]?.concurrencyFull
+                  ? 'bg-amber-50 text-amber-700 ring-1 ring-amber-200 dark:bg-amber-900/25 dark:text-amber-300 dark:ring-amber-800'
+                  : (concurrencyRows[row.id]?.current ?? 0) > 0
                   ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200 dark:bg-emerald-900/25 dark:text-emerald-300 dark:ring-emerald-800'
                   : 'bg-gray-100 text-gray-500 dark:bg-dark-700 dark:text-dark-400'
               ]"
@@ -197,14 +200,11 @@
               <span class="sr-only">{{ t('keys.concurrencyCount') }}{{ ' ' }}</span>
               <span class="whitespace-nowrap font-mono">
                 {{ concurrencyRows[row.id]?.current ?? '—' }}
-                <span v-if="row.concurrency_limit !== 0" class="ml-1">/ {{ row.concurrency_limit ?? '—' }}</span>
+                <span class="ml-1">/ {{ concurrencyRows[row.id]?.limit ?? '—' }}</span>
               </span>
             </span>
-            <span v-if="row.concurrency_limit === 0" class="mt-1 block text-xs text-gray-500 dark:text-dark-400">
-              {{ t('keys.noAdditionalConcurrencyLimit') }}
-            </span>
-            <div v-else class="mt-1 text-xs tabular-nums text-gray-500 dark:text-dark-400">
-              <template v-if="queuePolicy && row.concurrency_limit > 0">
+            <div class="mt-1 text-xs tabular-nums text-gray-500 dark:text-dark-400">
+              <template v-if="queuePolicy && concurrencyRows[row.id]?.limit > 0">
                 <span v-if="queuePolicy.max_waiting === 0" class="block">{{ t('keys.queueOff') }}</span>
                 <span v-if="queuePolicy.max_waiting > 0 || (concurrencyRows[row.id]?.waiting ?? 0) > 0"
                   :class="{ 'text-amber-600 dark:text-amber-400': concurrencyRows[row.id]?.full }">
@@ -212,7 +212,9 @@
                     'inline-flex items-center gap-1 rounded-md px-1.5 py-px font-normal leading-tight tabular-nums',
                     concurrencyRows[row.id]?.full
                       ? 'bg-amber-50 text-amber-700 ring-1 ring-amber-200 dark:bg-amber-900/25 dark:text-amber-300 dark:ring-amber-800'
-                      : 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200 dark:bg-emerald-900/25 dark:text-emerald-300 dark:ring-emerald-800'
+                      : concurrencyRows[row.id]?.waiting === 0
+                        ? 'bg-gray-100 text-gray-500 dark:bg-dark-700 dark:text-dark-400'
+                        : 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200 dark:bg-emerald-900/25 dark:text-emerald-300 dark:ring-emerald-800'
                   ]" :title="t('keys.waitingCount')">
                     <svg class="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <circle cx="12" cy="12" r="9" />
@@ -229,6 +231,7 @@
             <span v-if="concurrencyRows[row.id]?.notice" class="mt-1 block text-xs text-gray-500 dark:text-dark-400">
               {{ concurrencyRows[row.id].notice }}
             </span>
+            </template>
           </template>
 
           <template #cell-usage="{ row }">
@@ -1361,10 +1364,13 @@ const concurrencyRows = computed(() => {
     const waiting = count?.current_waiting
     const known = typeof current === 'number' && typeof waiting === 'number'
     const status = concurrencyState.value.status
+    const limit = key.concurrency_limit
     return [key.id, {
+      limit,
       current,
       waiting,
-      full: status === 'ready' && known && key.concurrency_limit > 0 &&
+      concurrencyFull: status === 'ready' && typeof current === 'number' && limit > 0 && current >= limit,
+      full: status === 'ready' && known && limit > 0 &&
         (queuePolicy.value?.max_waiting ?? 0) > 0 && waiting >= queuePolicy.value!.max_waiting,
       notice: status === 'stale' && count ? t('keys.concurrencyStale') :
         !known ? t(status === 'loading' ? 'keys.concurrencyLoading' : 'keys.concurrencyUnavailable') : '',

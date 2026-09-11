@@ -448,10 +448,10 @@ describe('user KeysView column settings', () => {
     expect(columnMenuText).not.toContain('Actions')
   })
 
-  it('renders the current concurrency value', async () => {
+  it('hides concurrency and waiting for an unconfigured key', async () => {
     const wrapper = await mountView()
 
-    expect(wrapper.get('[data-test="current-concurrency"]').text()).toBe('Concurrency 3 No additional limit')
+    expect(wrapper.get('[data-test="current-concurrency"]').text()).toBe('')
   })
 
   it('shows current / max for a key with an additional concurrency limit', async () => {
@@ -460,6 +460,35 @@ describe('user KeysView column settings', () => {
     const cell = wrapper.get('[data-test="current-concurrency"]')
     expect(cell.text()).toContain('Concurrency 3 / 8')
     expect(cell.text()).toContain('Waiting 2 / 7')
+  })
+
+  it.each([[0, 'gray'], [2, 'emerald'], [4, 'amber'], [5, 'amber']])(
+    'distinguishes concurrency %s against limit 4', async (current, color) => {
+      setKeys({ ...createApiKey(), concurrency_limit: 4 })
+      getConcurrency.mockResolvedValue({ ...snapshot(), items: [
+        { id: 1, current_concurrency: current as number, current_waiting: 0 },
+      ] })
+      const wrapper = await mountView()
+      const badge = wrapper.get('[data-test="current-concurrency"] [title="Concurrency"]')
+      expect(badge.text()).toContain(`Concurrency ${current} / 4`)
+      expect(badge.classes().join(' ')).toContain(`text-${color}-`)
+    }
+  )
+
+  it('shows and hides the list information after saving a changed limit', async () => {
+    setKeys({ ...createApiKey(), group_id: 42, concurrency_limit: 0 })
+    const wrapper = await mountView()
+    for (const limit of [4, 0]) {
+      await getButtonByText(wrapper, 'common.edit').trigger('click')
+      if (limit === 4) expect(wrapper.get('#key-queue-policy').text()).toBe('No key-level queue.')
+      await wrapper.get('#key-concurrency-limit').setValue(limit)
+      setKeys({ ...createApiKey(), group_id: 42, concurrency_limit: limit })
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      const text = wrapper.get('[data-test="current-concurrency"]').text()
+      if (limit === 0) expect(text).toBe('')
+      else expect(text).toContain('Concurrency 3 / 4')
+    }
   })
 
   it.each([8, 0, ''])('creates a key with concurrency input %s and resets the form', async (input) => {
@@ -591,7 +620,7 @@ describe('user KeysView column settings', () => {
     expect(rows[0]).toContain('Waiting 2 / 7')
     expect(rows[0]).not.toContain('Full')
     expect(rows[1]).toContain('Waiting 9 / 7 · Full')
-    expect(rows[2]).toBe('Concurrency 2 No additional limit')
+    expect(rows[2]).toBe('')
   })
 
   it('shows global-off policy and actual residual waiting without a zero denominator', async () => {
