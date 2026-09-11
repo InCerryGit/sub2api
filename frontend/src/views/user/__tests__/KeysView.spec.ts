@@ -448,10 +448,17 @@ describe('user KeysView column settings', () => {
     expect(columnMenuText).not.toContain('Actions')
   })
 
-  it('hides concurrency and waiting for an unconfigured key', async () => {
+  it.each([0, 3])('keeps the concurrency badge at %s for an unlimited key', async (current) => {
+    getConcurrency.mockResolvedValue({ ...snapshot(), items: [
+      { id: 1, current_concurrency: current, current_waiting: 0 },
+    ] })
     const wrapper = await mountView()
-
-    expect(wrapper.get('[data-test="current-concurrency"]').text()).toBe('')
+    const cell = wrapper.get('[data-test="current-concurrency"]')
+    const badge = cell.get('[title="Concurrency"]')
+    expect(badge.find('svg').exists()).toBe(true)
+    expect(badge.classes()).toContain(current === 0 ? 'bg-gray-100' : 'bg-emerald-50')
+    expect(cell.text()).toBe(`Concurrency ${current}`)
+    expect(cell.text()).not.toMatch(/\/|No additional limit|Waiting/)
   })
 
   it('shows current / max for a key with an additional concurrency limit', async () => {
@@ -475,7 +482,7 @@ describe('user KeysView column settings', () => {
     }
   )
 
-  it('shows and hides the list information after saving a changed limit', async () => {
+  it('keeps the badge and switches its denominator after saving a changed limit', async () => {
     setKeys({ ...createApiKey(), group_id: 42, concurrency_limit: 0 })
     const wrapper = await mountView()
     for (const limit of [4, 0]) {
@@ -485,8 +492,10 @@ describe('user KeysView column settings', () => {
       setKeys({ ...createApiKey(), group_id: 42, concurrency_limit: limit })
       await wrapper.get('#key-form').trigger('submit')
       await flushPromises()
-      const text = wrapper.get('[data-test="current-concurrency"]').text()
-      if (limit === 0) expect(text).toBe('')
+      const cell = wrapper.get('[data-test="current-concurrency"]')
+      expect(cell.get('[title="Concurrency"]').find('svg').exists()).toBe(true)
+      const text = cell.text()
+      if (limit === 0) expect(text).toBe('Concurrency 3')
       else expect(text).toContain('Concurrency 3 / 4')
     }
   })
@@ -620,7 +629,7 @@ describe('user KeysView column settings', () => {
     expect(rows[0]).toContain('Waiting 2 / 7')
     expect(rows[0]).not.toContain('Full')
     expect(rows[1]).toContain('Waiting 9 / 7 · Full')
-    expect(rows[2]).toBe('')
+    expect(rows[2]).toBe('Concurrency 2')
   })
 
   it('shows global-off policy and actual residual waiting without a zero denominator', async () => {
@@ -642,7 +651,7 @@ describe('user KeysView column settings', () => {
     getConcurrency.mockResolvedValue({ ...snapshot(), items: [] })
     const wrapper = await mountView()
     const text = wrapper.get('[data-test="current-concurrency"]').text()
-    expect(text).toContain('Concurrency — / —')
+    expect(text).toContain('Concurrency —')
     expect(text).toContain('Statistics unavailable')
     expect(text).not.toContain('No additional limit')
   })

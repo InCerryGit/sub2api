@@ -175,7 +175,6 @@
           </template>
 
           <template #cell-current_concurrency="{ row }">
-            <template v-if="concurrencyRows[row.id]?.limit !== 0">
             <span
               :title="t('keys.concurrencyCount')"
               :class="[
@@ -200,10 +199,10 @@
               <span class="sr-only">{{ t('keys.concurrencyCount') }}{{ ' ' }}</span>
               <span class="whitespace-nowrap font-mono">
                 {{ concurrencyRows[row.id]?.current ?? '—' }}
-                <span class="ml-1">/ {{ concurrencyRows[row.id]?.limit ?? '—' }}</span>
+                <span v-if="concurrencyRows[row.id]?.limit > 0" class="ml-1">/ {{ concurrencyRows[row.id]?.limit }}</span>
               </span>
             </span>
-            <div class="mt-1 text-xs tabular-nums text-gray-500 dark:text-dark-400">
+            <div v-if="concurrencyRows[row.id]?.limit > 0" class="mt-1 text-xs tabular-nums text-gray-500 dark:text-dark-400">
               <template v-if="queuePolicy && concurrencyRows[row.id]?.limit > 0">
                 <span v-if="queuePolicy.max_waiting === 0" class="block">{{ t('keys.queueOff') }}</span>
                 <span v-if="queuePolicy.max_waiting > 0 || (concurrencyRows[row.id]?.waiting ?? 0) > 0"
@@ -231,7 +230,6 @@
             <span v-if="concurrencyRows[row.id]?.notice" class="mt-1 block text-xs text-gray-500 dark:text-dark-400">
               {{ concurrencyRows[row.id].notice }}
             </span>
-            </template>
           </template>
 
           <template #cell-usage="{ row }">
