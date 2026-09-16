@@ -731,17 +731,17 @@ read at process startup:
 gateway:
   api_key_queue:
     # Extra waiting requests per limited API key; 0 disables key queueing.
-    max_waiting: 20
+    max_waiting: 5
     # Longest wait per request, in seconds; must be a positive integer.
     timeout_seconds: 30
 ```
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GATEWAY_API_KEY_QUEUE_MAX_WAITING` | `20` | Extra waiting requests allowed for **each** key with `concurrency_limit > 0`; `0` disables key queueing. |
+| `GATEWAY_API_KEY_QUEUE_MAX_WAITING` | `5` | Extra waiting requests allowed for **each** key with `concurrency_limit > 0`; `0` disables key queueing. |
 | `GATEWAY_API_KEY_QUEUE_TIMEOUT_SECONDS` | `30` | Longest time one request may wait for key capacity, in seconds. Must be a positive integer; `0` is rejected at startup. |
 
-- Waiting slots are per API key, not a global pool: `20` means up to 20 waiters
+- Waiting slots are per API key, not a global pool: `5` means up to 5 waiters
   for every key that enforces a concurrency limit. Keys with
   `concurrency_limit: 0` are not queued.
 - The queue applies to key admission for HTTP/SSE forwarding and OpenAI

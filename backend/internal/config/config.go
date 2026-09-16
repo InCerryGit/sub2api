@@ -966,7 +966,7 @@ const (
 	APIKeyQueueMaxWaitingEnv     = "GATEWAY_API_KEY_QUEUE_MAX_WAITING"
 	APIKeyQueueTimeoutSecondsEnv = "GATEWAY_API_KEY_QUEUE_TIMEOUT_SECONDS"
 
-	defaultAPIKeyQueueMaxWaiting     = 20
+	defaultAPIKeyQueueMaxWaiting     = 5
 	defaultAPIKeyQueueTimeoutSeconds = 30
 	// Keep seconds*time.Second and seconds*1000 inside int64/float64 exact range.
 	maxAPIKeyQueueTimeoutSeconds = math.MaxInt64 / int64(time.Second)

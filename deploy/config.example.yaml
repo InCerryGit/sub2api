@@ -515,7 +515,7 @@ gateway:
   api_key_queue:
     # Extra waiting requests per API key with concurrency_limit>0; 0 disables key queueing.
     # 每个受限 Key 允许额外等待的请求数；0 关闭 Key 排队（仍保留并发上限）。
-    max_waiting: 20
+    max_waiting: 5
     # Max wait budget per request in seconds (positive integer; 0 is rejected).
     # 单个请求等待 Key 容量的最长秒数（正整数，0 会被拒绝）。
     timeout_seconds: 30

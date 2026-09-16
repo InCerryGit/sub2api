@@ -61,7 +61,7 @@ func TestLoadAPIKeyQueueConfigDefaultsAndValidation(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		cfg, err := load(t, "", "")
 		require.NoError(t, err)
-		require.Equal(t, 20, cfg.MaxWaiting)
+		require.Equal(t, 5, cfg.MaxWaiting)
 		require.Equal(t, 30, cfg.TimeoutSeconds)
 	})
 
