@@ -65,6 +65,9 @@ const (
 	activeIndexCleanupBatchSize  = 1000
 	activeIndexPipelineChunkSize = 500
 
+	// 启动期 API Key 清理按 SCAN 页流式处理，避免把所有匹配键一次性载入内存。
+	startupAPIKeyScanBatchSize = 200
+
 	// 一次性迁移 marker：活跃索引机制上线前遗留的等待计数键无法被索引发现，
 	// 且有流量时 TTL 会被不断刷新，必须清扫一次。marker 存在即代表已完成。
 	legacyWaitSweepMarkerKey = "concurrency:startup:legacy_wait_sweep:v1"
@@ -563,6 +566,50 @@ var (
 			redis.call('DEL', key)
 		else
 			redis.call('EXPIRE', key, slotTTL)
+		end
+		return {removed, remaining}
+	`)
+
+	// startupCleanupAPIKeyZSetScript removes stale process members and expired
+	// members from one API-key-scoped ZSET. The caller supplies score units so
+	// the same script can handle second-based leases and millisecond deadlines.
+	// ARGV[1] = current process prefix
+	// ARGV[2] = current time in the ZSET score unit
+	// ARGV[3] = inclusive expiration cutoff in the ZSET score unit
+	// ARGV[4] = member lifetime after its score (seconds-based keys only)
+	// ARGV[5] = key grace after the latest score (deadline-based keys only)
+	// ARGV[6] = score units per second (1 or 1000)
+	// Returns {removed members, remaining members}.
+	startupCleanupAPIKeyZSetScript = redis.NewScript(`
+		local key = KEYS[1]
+		local activePrefix = ARGV[1]
+		local nowScore = tonumber(ARGV[2])
+		local expiredBefore = tonumber(ARGV[3])
+		local memberLifetime = tonumber(ARGV[4])
+		local keyGrace = tonumber(ARGV[5])
+		local scoreUnitsPerSecond = tonumber(ARGV[6])
+		local removed = 0
+		local maxScore = nil
+		local members = redis.call('ZRANGE', key, 0, -1, 'WITHSCORES')
+		for index = 1, #members, 2 do
+			local member = members[index]
+			local score = tonumber(members[index + 1])
+			if score == nil or score <= expiredBefore or string.sub(member, 1, string.len(activePrefix)) ~= activePrefix then
+				removed = removed + redis.call('ZREM', key, member)
+			elseif maxScore == nil or score > maxScore then
+				maxScore = score
+			end
+		end
+
+		local remaining = redis.call('ZCARD', key)
+		if remaining == 0 then
+			redis.call('DEL', key)
+		else
+			-- Recreate the same expiry implied by the surviving latest member;
+			-- do not extend a key beyond its existing slot/deadline semantics.
+			local ttlSeconds = math.ceil((maxScore + memberLifetime + keyGrace - nowScore) / scoreUnitsPerSecond)
+			if ttlSeconds < 1 then ttlSeconds = 1 end
+			redis.call('EXPIRE', key, ttlSeconds)
 		end
 		return {removed, remaining}
 	`)
@@ -1823,10 +1870,11 @@ func (c *concurrencyCache) reconcileExpiredIndexCandidates(ctx context.Context, 
 }
 
 // CleanupStaleProcessSlots 启动时清理非当前进程前缀的槽位。
-// 清理范围来自活跃索引（含 score 已过期的成员——它们往往正是崩溃进程留下的残留），
-// 避免在 Redis 上 SCAN 全部 concurrency:* 键；另有一次性迁移清扫兜底索引机制上线前的遗留等待计数。
-// API Key 槽位（concurrency:api_key:*）是 stats-only 数据：每次 Track/读取都会按分数
-// 裁剪过期成员，key 自带 TTL，可在一个 slot TTL 内自愈，因此不参与启动清理。
+// 账号/用户清理范围来自活跃索引（含 score 已过期的成员——它们往往正是崩溃进程留下的残留），
+// 另有一次性迁移清扫兜底索引机制上线前的遗留等待计数。
+// API Key 没有活跃索引，且其 regular/live/等待/栅栏/WS ingress 状态都可能在重启后继续
+// 影响 admission，因此启动期按六个精确前缀做有界分页 SCAN。每页立即处理，保留当前进程
+// 前缀成员，只删除旧进程或已过期成员；空 ZSET 会被删除，SCAN/清理错误会直接返回。
 func (c *concurrencyCache) CleanupStaleProcessSlots(ctx context.Context, activeRequestPrefix string) error {
 	if activeRequestPrefix == "" {
 		return nil
@@ -1834,10 +1882,11 @@ func (c *concurrencyCache) CleanupStaleProcessSlots(ctx context.Context, activeR
 	if err := c.sweepLegacyWaitKeysOnce(ctx); err != nil {
 		return err
 	}
-	now, err := c.redisUnixSeconds(ctx)
+	redisNow, err := c.rdb.Time(ctx).Result()
 	if err != nil {
-		return err
+		return fmt.Errorf("redis TIME: %w", err)
 	}
+	now := redisNow.Unix()
 
 	accountMembers, err := c.allIndexMembers(ctx, accountActiveIndexKey)
 	if err != nil {
@@ -1851,7 +1900,102 @@ func (c *concurrencyCache) CleanupStaleProcessSlots(ctx context.Context, activeR
 	if err != nil {
 		return err
 	}
-	return c.cleanupStaleProcessSlotsForIndex(ctx, userSlotIndex, userMembers, activeRequestPrefix, now)
+	if err := c.cleanupStaleProcessSlotsForIndex(ctx, userSlotIndex, userMembers, activeRequestPrefix, now); err != nil {
+		return err
+	}
+	return c.cleanupStaleAPIKeyZSets(ctx, activeRequestPrefix, redisNow)
+}
+
+type apiKeyStartupCleanupSpec struct {
+	pattern             string
+	nowScore            int64
+	expiredBefore       int64
+	memberLifetime      int64
+	keyGrace            int64
+	scoreUnitsPerSecond int64
+}
+
+// cleanupStaleAPIKeyZSets scans only API-key concurrency namespaces. The scan
+// cursor and each page remain bounded; processing a page before requesting the
+// next one avoids retaining the full key set during startup.
+func (c *concurrencyCache) cleanupStaleAPIKeyZSets(ctx context.Context, activeRequestPrefix string, redisNow time.Time) error {
+	nowSeconds := redisNow.Unix()
+	nowMilliseconds := redisNow.UnixMilli()
+	queueGraceMilliseconds := int64(apiKeyQueueCleanupGraceSeconds) * 1000
+	specs := []apiKeyStartupCleanupSpec{
+		{
+			pattern:             apiKeySlotKeyPrefix + "*",
+			nowScore:            nowSeconds,
+			expiredBefore:       nowSeconds - int64(c.slotTTLSeconds),
+			memberLifetime:      int64(c.slotTTLSeconds),
+			scoreUnitsPerSecond: 1,
+		},
+		{
+			pattern:             liveAPIKeySlotKeyPrefix + "*",
+			nowScore:            nowSeconds,
+			expiredBefore:       nowSeconds - int64(liveLeaseTTLSeconds),
+			memberLifetime:      int64(liveLeaseTTLSeconds),
+			scoreUnitsPerSecond: 1,
+		},
+		{
+			pattern:             apiKeyWaitKeyPrefix + "*",
+			nowScore:            nowMilliseconds,
+			expiredBefore:       nowMilliseconds,
+			keyGrace:            queueGraceMilliseconds,
+			scoreUnitsPerSecond: 1000,
+		},
+		{
+			pattern:             apiKeyWaitClosedKeyPrefix + "*",
+			nowScore:            nowMilliseconds,
+			expiredBefore:       nowMilliseconds,
+			keyGrace:            queueGraceMilliseconds,
+			scoreUnitsPerSecond: 1000,
+		},
+		{
+			pattern:             liveTransferFenceKeyPrefix + "*",
+			nowScore:            nowMilliseconds,
+			expiredBefore:       nowMilliseconds,
+			scoreUnitsPerSecond: 1000,
+		},
+		{
+			pattern:             openAIWSIngressLeaseKeyPrefix + "*",
+			nowScore:            nowSeconds,
+			expiredBefore:       nowSeconds - int64(openAIWSIngressLeaseTTLSeconds),
+			memberLifetime:      int64(openAIWSIngressLeaseTTLSeconds),
+			scoreUnitsPerSecond: 1,
+		},
+	}
+
+	for _, spec := range specs {
+		var cursor uint64
+		for {
+			keys, nextCursor, err := c.rdb.Scan(ctx, cursor, spec.pattern, startupAPIKeyScanBatchSize).Result()
+			if err != nil {
+				return fmt.Errorf("scan API key concurrency keys %s: %w", spec.pattern, err)
+			}
+			for _, key := range keys {
+				if _, _, err := runScriptInt64Pair(
+					ctx,
+					c.rdb,
+					startupCleanupAPIKeyZSetScript,
+					[]string{key},
+					activeRequestPrefix,
+					spec.nowScore,
+					spec.expiredBefore,
+					spec.memberLifetime,
+					spec.keyGrace,
+					spec.scoreUnitsPerSecond,
+				); err != nil {
+					return fmt.Errorf("cleanup API key concurrency key %s: %w", key, err)
+				}
+			}
+			cursor = nextCursor
+			if cursor == 0 {
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // sweepLegacyWaitKeysOnce 一次性清扫活跃索引机制上线前遗留的等待计数键。
